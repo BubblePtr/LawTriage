@@ -22,3 +22,7 @@ Type: AFK
 ## Blocked by
 
 - `.scratch/law-triage-demo/issues/01-demo-app-session-loop.md`
+
+## Comments
+
+- 2026-05-30：已完成首轮实现。`DemoSession` 现在包含按时间排序的 transcript 事件；创建 session 后会自动播放 9 条模拟对话字幕；当前会话区域区分“当事人”和“AI 分诊 Agent”；结束通话后结构化结果会保留完整转写摘要和行数。已通过 `bun run build`、浏览器交互脚本和结束态截图检查。

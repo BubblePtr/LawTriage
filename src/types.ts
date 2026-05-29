@@ -11,6 +11,15 @@ export type CaseGrade = "大" | "中" | "小";
 
 export type RiskLevel = "正常" | "敏感" | "无效" | "恶意";
 
+export type TranscriptSpeaker = "client" | "agent";
+
+export type TranscriptEvent = {
+  id: string;
+  speaker: TranscriptSpeaker;
+  text: string;
+  timestamp: Date;
+};
+
 export type StructuredResult = {
   clientProfile: {
     name: string;
@@ -33,6 +42,12 @@ export type StructuredResult = {
     level: RiskLevel;
     note: string;
   };
+  transcript: {
+    events: TranscriptEvent[];
+    fullText: string;
+    lineCount: number;
+    summary: string;
+  };
 };
 
 export type DemoSession = {
@@ -40,6 +55,7 @@ export type DemoSession = {
   status: Exclude<CallStatus, "idle">;
   intake: IntakeForm;
   startedAt: Date;
+  transcript: TranscriptEvent[];
   endedAt?: Date;
   structuredResult?: StructuredResult;
 };

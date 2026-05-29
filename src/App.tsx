@@ -15,12 +15,16 @@ import {
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
+  appendTranscriptEvent,
   createDemoSession,
+  createMockTranscriptEvent,
   endDemoSession,
   formatDateTime,
   formatDuration,
+  formatTranscriptTime,
+  getMockTranscriptLength,
 } from "./demoSession";
-import type { CallStatus, DemoSession, IntakeForm, StructuredResult } from "./types";
+import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent } from "./types";
 
 const initialIntake: IntakeForm = {
   phone: "138 0013 8000",
@@ -37,6 +41,9 @@ function App() {
   const status: CallStatus = session?.status ?? "idle";
   const canStart = status !== "active" && isValidIntake(intake);
   const canEnd = status === "active";
+  const transcriptEvents = session?.transcript ?? [];
+  const latestTranscriptEvent = transcriptEvents.at(-1);
+  const transcriptProgress = `${transcriptEvents.length}/${getMockTranscriptLength()}`;
 
   useEffect(() => {
     if (!session || session.status !== "active") {
@@ -49,6 +56,35 @@ function App() {
     }, 1000);
 
     return () => window.clearInterval(timer);
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || session.status !== "active") {
+      return;
+    }
+
+    if (session.transcript.length >= getMockTranscriptLength()) {
+      return;
+    }
+
+    const delay = session.transcript.length === 0 ? 700 : 1700;
+    const timer = window.setTimeout(() => {
+      setSession((current) => {
+        if (!current || current.status !== "active") {
+          return current;
+        }
+
+        const event = createMockTranscriptEvent(current.intake, current.transcript.length);
+
+        if (!event) {
+          return current;
+        }
+
+        return appendTranscriptEvent(current, event);
+      });
+    }, delay);
+
+    return () => window.clearTimeout(timer);
   }, [session]);
 
   const dashboardDuration = useMemo(() => {
@@ -194,13 +230,12 @@ function App() {
                 <FileText size={16} />
                 实时通话转写
               </span>
-              <span className="toolbar-caption">第 2 条 issue 接入 transcript 事件流</span>
+              <span className="toolbar-caption">
+                {status === "active" ? `模拟字幕播放中 ${transcriptProgress}` : `转写事件 ${transcriptProgress}`}
+              </span>
             </div>
-            <div className="transcript-empty">
-              <FileText size={56} />
-              <strong>{getTranscriptTitle(status)}</strong>
-              <span>{getTranscriptHint(status)}</span>
-            </div>
+            <TranscriptFeed events={transcriptEvents} status={status} />
+            <ClientCaptionPreview event={latestTranscriptEvent} />
           </div>
           <div className="session-footer">
             {status === "active" ? "AI 助理正在与客户通话中，请勿随意打断。" : "结束通话后，右侧档案会自动更新。"}
@@ -337,6 +372,50 @@ function ResultSections({ result }: { result?: StructuredResult }) {
           ["风险说明", result?.risk.note],
         ]}
       />
+      <ResultSection
+        icon={<FileText size={18} />}
+        title="完整转写"
+        rows={[
+          ["转写行数", result ? `${result.transcript.lineCount} 条` : undefined],
+          ["转写摘要", result?.transcript.summary],
+          ["最新内容", result?.transcript.events.at(-1)?.text],
+        ]}
+      />
+    </div>
+  );
+}
+
+function TranscriptFeed({ events, status }: { events: TranscriptEvent[]; status: CallStatus }) {
+  if (events.length === 0) {
+    return (
+      <div className="transcript-empty">
+        <FileText size={56} />
+        <strong>{getTranscriptTitle(status)}</strong>
+        <span>{getTranscriptHint(status)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <ol className="transcript-feed" aria-label="实时通话转写">
+      {events.map((event) => (
+        <li className={`transcript-line transcript-${event.speaker}`} key={event.id}>
+          <div className="transcript-meta">
+            <span>{getTranscriptSpeakerLabel(event)}</span>
+            <time dateTime={event.timestamp.toISOString()}>{formatTranscriptTime(event.timestamp)}</time>
+          </div>
+          <p>{event.text}</p>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function ClientCaptionPreview({ event }: { event?: TranscriptEvent }) {
+  return (
+    <div className="client-caption-preview" aria-label="当事人端字幕预览">
+      <span>当事人端字幕预览</span>
+      <strong>{event ? `${getTranscriptSpeakerLabel(event)}：${event.text}` : "等待会话字幕事件"}</strong>
     </div>
   );
 }
@@ -412,6 +491,10 @@ function getTranscriptHint(status: CallStatus): string {
   }
 
   return "填写客户信息并点击开始咨询。";
+}
+
+function getTranscriptSpeakerLabel(event: TranscriptEvent): string {
+  return event.speaker === "agent" ? "AI 分诊 Agent" : "当事人";
 }
 
 export default App;
