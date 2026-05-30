@@ -16,9 +16,13 @@ import {
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  createDefaultAgentProviders,
+  createInitialAgentState,
+} from "./agentPipeline";
+import {
   appendTranscriptEvent,
+  createAgentTranscriptEvent,
   createDemoSession,
-  createMockTranscriptEvent,
   endDemoSession,
   formatDateTime,
   formatDuration,
@@ -26,12 +30,17 @@ import {
   getMockTranscriptLength,
 } from "./demoSession";
 import {
+  formatMissingTriageSlots,
+  getTriageSlotValue,
+} from "./triageSlots";
+import {
   createInitialMediaConfig,
   createInitialMediaState,
   createMediaSessionAdapter,
   validateMediaSessionConfig,
 } from "./mediaSession";
-import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent } from "./types";
+import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent, TriageSlotKey } from "./types";
+import type { AgentRuntimeState } from "./agentPipeline";
 import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } from "./mediaSession";
 
 const initialIntake: IntakeForm = {
@@ -41,18 +50,25 @@ const initialIntake: IntakeForm = {
   city: "上海市",
 };
 
+const agentProviders = createDefaultAgentProviders();
+
 function App() {
   const [intake, setIntake] = useState<IntakeForm>(initialIntake);
   const [session, setSession] = useState<DemoSession | null>(null);
+  const [agentState, setAgentState] = useState<AgentRuntimeState>(() =>
+    createInitialAgentState(agentProviders),
+  );
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [mediaConfig, setMediaConfig] = useState<MediaSessionConfig>(() => createInitialMediaConfig());
   const [mediaState, setMediaState] = useState<MediaConnectionState>(() =>
     createInitialMediaState(createInitialMediaConfig()),
   );
   const [mediaTransitionPending, setMediaTransitionPending] = useState(false);
+  const agentTurnQueueRef = useRef<Promise<void>>(Promise.resolve());
   const mediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const mediaTransitionPendingRef = useRef(false);
+  const sessionRef = useRef<DemoSession | null>(null);
 
   const status: CallStatus = session?.status ?? "idle";
   const canStart = !mediaTransitionPending && status !== "active" && isValidIntake(intake);
@@ -81,35 +97,6 @@ function App() {
       void pendingMediaSessionRef.current?.disconnect();
     };
   }, []);
-
-  useEffect(() => {
-    if (!session || session.status !== "active") {
-      return;
-    }
-
-    if (session.transcript.length >= getMockTranscriptLength()) {
-      return;
-    }
-
-    const delay = session.transcript.length === 0 ? 700 : 1700;
-    const timer = window.setTimeout(() => {
-      setSession((current) => {
-        if (!current || current.status !== "active") {
-          return current;
-        }
-
-        const event = createMockTranscriptEvent(current.intake, current.transcript.length);
-
-        if (!event) {
-          return current;
-        }
-
-        return appendTranscriptEvent(current, event);
-      });
-    }, delay);
-
-    return () => window.clearTimeout(timer);
-  }, [session]);
 
   const dashboardDuration = useMemo(() => {
     if (!session) {
@@ -152,6 +139,100 @@ function App() {
     setMediaTransitionPending(nextPending);
   }
 
+  function commitSession(nextSession: DemoSession | null) {
+    sessionRef.current = nextSession;
+    setSession(nextSession);
+  }
+
+  function enqueueMediaTranscriptEvent(event: TranscriptEvent) {
+    const turn = agentTurnQueueRef.current
+      .then(() => processMediaTranscriptEvent(event))
+      .catch((error) => {
+        setAgentState({
+          providerLabel: agentProviders.label,
+          status: "failed",
+          detail: "Agent 处理媒体文本事件失败。",
+          error: getErrorMessage(error),
+        });
+      });
+
+    agentTurnQueueRef.current = turn;
+    void turn;
+  }
+
+  async function processMediaTranscriptEvent(event: TranscriptEvent) {
+    const currentSession = sessionRef.current;
+
+    if (!currentSession || currentSession.status !== "active") {
+      return;
+    }
+
+    const acceptedEvent = await agentProviders.asr.acceptTextEvent(event);
+    const latestBeforeInputCommit = sessionRef.current;
+
+    if (
+      !latestBeforeInputCommit ||
+      latestBeforeInputCommit.id !== currentSession.id ||
+      latestBeforeInputCommit.status !== "active"
+    ) {
+      return;
+    }
+
+    const sessionWithInput = appendTranscriptEvent(latestBeforeInputCommit, acceptedEvent);
+    commitSession(sessionWithInput);
+
+    if (acceptedEvent.speaker !== "client") {
+      return;
+    }
+
+    setAgentState({
+      providerLabel: agentProviders.label,
+      status: "thinking",
+      detail: "Agent 正在生成接待回复。",
+    });
+
+    try {
+      const turnIndex = sessionWithInput.transcript.filter((item) => item.speaker === "client").length;
+      const replyText = await agentProviders.llm.generateReply({
+        clientEvent: acceptedEvent,
+        session: sessionWithInput,
+        transcript: sessionWithInput.transcript,
+        turnIndex,
+      });
+      const latestSession = sessionRef.current;
+
+      if (!latestSession || latestSession.status !== "active") {
+        return;
+      }
+
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "speaking",
+        detail: "Agent 回复已生成，正在写回字幕流。",
+      });
+      await agentProviders.tts.synthesize(replyText);
+
+      const sessionWithReply = appendTranscriptEvent(
+        latestSession,
+        createAgentTranscriptEvent(replyText, new Date(Date.now() + 120)),
+      );
+      commitSession(sessionWithReply);
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "listening",
+        detail: "Agent 已回复，等待下一句客户输入。",
+        lastReplyAt: new Date(),
+      });
+    } catch (error) {
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "failed",
+        detail: "Agent 回复生成失败。",
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   async function handleStart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -188,6 +269,11 @@ function App() {
             setMediaState(nextState);
           }
         },
+        onTranscriptEvent: (event) => {
+          if (pendingMediaSessionRef.current === adapter || mediaSessionRef.current === adapter) {
+            enqueueMediaTranscriptEvent(event);
+          }
+        },
       });
       if (pendingMediaSessionRef.current !== adapter) {
         await adapter.disconnect();
@@ -196,15 +282,46 @@ function App() {
 
       mediaSessionRef.current = adapter;
       pendingMediaSessionRef.current = null;
-      setSession(nextSession);
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "thinking",
+        detail: "Agent 正在生成开场话术。",
+      });
+
+      const openingText = await agentProviders.llm.generateReply({
+        session: nextSession,
+        transcript: nextSession.transcript,
+        turnIndex: 0,
+      });
+      await agentProviders.tts.synthesize(openingText);
+      commitSession(appendTranscriptEvent(nextSession, createAgentTranscriptEvent(openingText)));
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "listening",
+        detail: "Agent 已开场，等待客户输入。",
+        lastReplyAt: new Date(),
+      });
       setElapsedSeconds(0);
-    } catch {
+    } catch (error) {
+      await adapter.disconnect().catch(() => undefined);
       if (pendingMediaSessionRef.current === adapter) {
         pendingMediaSessionRef.current = null;
       }
       if (mediaSessionRef.current === adapter) {
         mediaSessionRef.current = null;
       }
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "failed",
+        detail: "Agent 或 RTC 启动失败。",
+        error: getErrorMessage(error),
+      });
+      setMediaState({
+        mode: mediaConfig.mode,
+        status: "failed",
+        detail: "RTC 或 Agent 启动失败。",
+        error: getErrorMessage(error),
+      });
     } finally {
       if (pendingMediaSessionRef.current === adapter) {
         pendingMediaSessionRef.current = null;
@@ -218,7 +335,13 @@ function App() {
       return;
     }
 
+    const activeSession = sessionRef.current;
     const adapter = mediaSessionRef.current;
+
+    if (!activeSession || activeSession.status !== "active") {
+      return;
+    }
+
     setMediaTransition(true);
     setMediaState({
       mode: mediaConfig.mode,
@@ -227,7 +350,7 @@ function App() {
     });
 
     try {
-      setSession(endDemoSession(session));
+      commitSession(endDemoSession(activeSession));
       await adapter?.disconnect({
         onStateChange: (nextState) => {
           if (!adapter || mediaSessionRef.current === adapter) {
@@ -243,6 +366,11 @@ function App() {
         mode: mediaConfig.mode,
         status: "disconnected",
         detail: "RTC 媒体连接已断开，转写和结构化结果已保留。",
+      });
+      setAgentState({
+        providerLabel: agentProviders.label,
+        status: "idle",
+        detail: "演示会话已结束。",
       });
       setMediaTransition(false);
     }
@@ -364,6 +492,8 @@ function App() {
             <MetricRow label="通话时长" value={dashboardDuration} />
             <MetricRow label="呼叫方式" value="RTC 浏览器音频" />
             <MetricRow label="RTC 模式" value={mediaConfig.mode === "mock" ? "Dev Mock" : "LiveKit"} />
+            <MetricRow label="Agent 模式" value={agentState.providerLabel} />
+            <MetricRow label="Agent 状态" value={getAgentStatusLabel(agentState.status)} />
             <MetricRow label="坐席/机器人" value="AI 助理-小华" />
             <div className="control-actions">
               <button className="secondary-action" type="button" disabled>
@@ -377,7 +507,9 @@ function App() {
             </div>
           </section>
 
-          <p className="operator-note">提示：开始咨询后将创建演示 session，并在结束通话后生成档案占位结果。</p>
+          <p className={agentState.error ? "operator-note operator-note-error" : "operator-note"}>
+            {agentState.error ?? agentState.detail}
+          </p>
         </aside>
 
         <section className="session-panel" aria-label="当前会话">
@@ -398,7 +530,7 @@ function App() {
                 实时通话转写
               </span>
               <span className="toolbar-caption">
-                {status === "active" ? `模拟字幕播放中 ${transcriptProgress}` : `转写事件 ${transcriptProgress}`}
+                {status === "active" ? `Agent 对话 ${transcriptProgress}` : `转写事件 ${transcriptProgress}`}
               </span>
             </div>
             <TranscriptFeed events={transcriptEvents} status={status} />
@@ -522,6 +654,17 @@ function ResultSections({ result }: { result?: StructuredResult }) {
         ]}
       />
       <ResultSection
+        icon={<FileText size={18} />}
+        title="分诊槽位"
+        rows={[
+          ["档案完整度", formatSlotCompletion(result)],
+          ["缺失字段", formatMissingResultSlots(result)],
+          ["争议金额/标的", getResultSlotValue(result, "disputeAmount")],
+          ["紧急程度", getResultSlotValue(result, "urgency")],
+          ["期望沟通时间", getResultSlotValue(result, "expectedContactTime")],
+        ]}
+      />
+      <ResultSection
         icon={<CheckCircle2 size={18} />}
         title="案件分级"
         rows={[
@@ -558,6 +701,30 @@ function ResultSections({ result }: { result?: StructuredResult }) {
       />
     </div>
   );
+}
+
+function formatSlotCompletion(result?: StructuredResult): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return `${result.triageSlots.completedCount}/${result.triageSlots.totalCount}`;
+}
+
+function formatMissingResultSlots(result?: StructuredResult): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return formatMissingTriageSlots(result.triageSlots);
+}
+
+function getResultSlotValue(result: StructuredResult | undefined, key: TriageSlotKey): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return getTriageSlotValue(result.triageSlots, key);
 }
 
 function TranscriptFeed({ events, status }: { events: TranscriptEvent[]; status: CallStatus }) {
@@ -668,6 +835,26 @@ function getMediaStatusLabel(status: MediaConnectionState["status"]): string {
   return "未连接";
 }
 
+function getAgentStatusLabel(status: AgentRuntimeState["status"]): string {
+  if (status === "listening") {
+    return "监听中";
+  }
+
+  if (status === "thinking") {
+    return "生成中";
+  }
+
+  if (status === "speaking") {
+    return "写回中";
+  }
+
+  if (status === "failed") {
+    return "异常";
+  }
+
+  return "待开始";
+}
+
 function getTranscriptTitle(status: CallStatus): string {
   if (status === "active") {
     return "会话已创建，等待实时字幕接入";
@@ -682,7 +869,7 @@ function getTranscriptTitle(status: CallStatus): string {
 
 function getTranscriptHint(status: CallStatus): string {
   if (status === "active") {
-    return "当前切片先跑通 session 闭环；下一切片接入 transcript 事件。";
+    return "等待客户文本事件触发 AI 回复。";
   }
 
   if (status === "ended") {
@@ -694,6 +881,10 @@ function getTranscriptHint(status: CallStatus): string {
 
 function getTranscriptSpeakerLabel(event: TranscriptEvent): string {
   return event.speaker === "agent" ? "AI 分诊 Agent" : "当事人";
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export default App;
