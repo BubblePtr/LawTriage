@@ -58,7 +58,7 @@ export function createMockClientTranscriptEvent(
 }
 
 export function createAgentTranscriptEvent(text: string, timestamp = new Date()): TranscriptEvent {
-  return createTranscriptEvent("agent", text, timestamp, "agent");
+  return createTranscriptEvent("agent", text, timestamp);
 }
 
 function createTranscriptEvent(

@@ -168,7 +168,17 @@ function App() {
     }
 
     const acceptedEvent = await agentProviders.asr.acceptTextEvent(event);
-    const sessionWithInput = appendTranscriptEvent(currentSession, acceptedEvent);
+    const latestBeforeInputCommit = sessionRef.current;
+
+    if (
+      !latestBeforeInputCommit ||
+      latestBeforeInputCommit.id !== currentSession.id ||
+      latestBeforeInputCommit.status !== "active"
+    ) {
+      return;
+    }
+
+    const sessionWithInput = appendTranscriptEvent(latestBeforeInputCommit, acceptedEvent);
     commitSession(sessionWithInput);
 
     if (acceptedEvent.speaker !== "client") {
