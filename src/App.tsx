@@ -9,11 +9,12 @@ import {
   Phone,
   PhoneCall,
   PhoneOff,
+  RadioTower,
   Scale,
   ShieldCheck,
   UserRound,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   appendTranscriptEvent,
   createDemoSession,
@@ -24,7 +25,14 @@ import {
   formatTranscriptTime,
   getMockTranscriptLength,
 } from "./demoSession";
+import {
+  createInitialMediaConfig,
+  createInitialMediaState,
+  createMediaSessionAdapter,
+  validateMediaSessionConfig,
+} from "./mediaSession";
 import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent } from "./types";
+import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } from "./mediaSession";
 
 const initialIntake: IntakeForm = {
   phone: "138 0013 8000",
@@ -37,10 +45,19 @@ function App() {
   const [intake, setIntake] = useState<IntakeForm>(initialIntake);
   const [session, setSession] = useState<DemoSession | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [mediaConfig, setMediaConfig] = useState<MediaSessionConfig>(() => createInitialMediaConfig());
+  const [mediaState, setMediaState] = useState<MediaConnectionState>(() =>
+    createInitialMediaState(createInitialMediaConfig()),
+  );
+  const [mediaTransitionPending, setMediaTransitionPending] = useState(false);
+  const mediaSessionRef = useRef<MediaSessionAdapter | null>(null);
+  const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
+  const mediaTransitionPendingRef = useRef(false);
 
   const status: CallStatus = session?.status ?? "idle";
-  const canStart = status !== "active" && isValidIntake(intake);
-  const canEnd = status === "active";
+  const canStart = !mediaTransitionPending && status !== "active" && isValidIntake(intake);
+  const canEnd = !mediaTransitionPending && status === "active";
+  const mediaConfigLocked = mediaTransitionPending || status === "active";
   const transcriptEvents = session?.transcript ?? [];
   const latestTranscriptEvent = transcriptEvents.at(-1);
   const transcriptProgress = `${transcriptEvents.length}/${getMockTranscriptLength()}`;
@@ -57,6 +74,13 @@ function App() {
 
     return () => window.clearInterval(timer);
   }, [session]);
+
+  useEffect(() => {
+    return () => {
+      void mediaSessionRef.current?.disconnect();
+      void pendingMediaSessionRef.current?.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     if (!session || session.status !== "active") {
@@ -106,25 +130,122 @@ function App() {
     }));
   }
 
-  function handleStart(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    if (!canStart) {
+  function updateMediaConfig(field: keyof MediaSessionConfig, value: string) {
+    if (mediaConfigLocked || mediaTransitionPendingRef.current) {
       return;
     }
 
-    setSession(createDemoSession(intake));
-    setElapsedSeconds(0);
+    setMediaConfig((current) => {
+      const next = {
+        ...current,
+        [field]: value,
+      };
+
+      setMediaState(createInitialMediaState(next));
+
+      return next;
+    });
   }
 
-  function handleEndCall() {
-    setSession((current) => {
-      if (!current || current.status !== "active") {
-        return current;
+  function setMediaTransition(nextPending: boolean) {
+    mediaTransitionPendingRef.current = nextPending;
+    setMediaTransitionPending(nextPending);
+  }
+
+  async function handleStart(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!canStart || mediaTransitionPendingRef.current) {
+      return;
+    }
+
+    const validationError = validateMediaSessionConfig(mediaConfig);
+
+    if (validationError) {
+      setMediaState({
+        mode: mediaConfig.mode,
+        status: "failed",
+        detail: "RTC 配置不完整。",
+        error: validationError,
+      });
+      return;
+    }
+
+    const nextSession = createDemoSession(intake);
+    const adapter = createMediaSessionAdapter(mediaConfig);
+    pendingMediaSessionRef.current = adapter;
+    setMediaTransition(true);
+    setMediaState({
+      mode: mediaConfig.mode,
+      status: "connecting",
+      detail: "正在准备 RTC 媒体连接。",
+    });
+
+    try {
+      await adapter.connect(nextSession, {
+        onStateChange: (nextState) => {
+          if (pendingMediaSessionRef.current === adapter || mediaSessionRef.current === adapter) {
+            setMediaState(nextState);
+          }
+        },
+      });
+      if (pendingMediaSessionRef.current !== adapter) {
+        await adapter.disconnect();
+        return;
       }
 
-      return endDemoSession(current);
+      mediaSessionRef.current = adapter;
+      pendingMediaSessionRef.current = null;
+      setSession(nextSession);
+      setElapsedSeconds(0);
+    } catch {
+      if (pendingMediaSessionRef.current === adapter) {
+        pendingMediaSessionRef.current = null;
+      }
+      if (mediaSessionRef.current === adapter) {
+        mediaSessionRef.current = null;
+      }
+    } finally {
+      if (pendingMediaSessionRef.current === adapter) {
+        pendingMediaSessionRef.current = null;
+      }
+      setMediaTransition(false);
+    }
+  }
+
+  async function handleEndCall() {
+    if (!session || session.status !== "active" || mediaTransitionPendingRef.current) {
+      return;
+    }
+
+    const adapter = mediaSessionRef.current;
+    setMediaTransition(true);
+    setMediaState({
+      mode: mediaConfig.mode,
+      status: "disconnecting",
+      detail: "正在断开 RTC 媒体连接。",
     });
+
+    try {
+      setSession(endDemoSession(session));
+      await adapter?.disconnect({
+        onStateChange: (nextState) => {
+          if (!adapter || mediaSessionRef.current === adapter) {
+            setMediaState(nextState);
+          }
+        },
+      });
+    } finally {
+      if (!adapter || mediaSessionRef.current === adapter) {
+        mediaSessionRef.current = null;
+      }
+      setMediaState({
+        mode: mediaConfig.mode,
+        status: "disconnected",
+        detail: "RTC 媒体连接已断开，转写和结构化结果已保留。",
+      });
+      setMediaTransition(false);
+    }
   }
 
   return (
@@ -192,11 +313,57 @@ function App() {
             </button>
           </form>
 
+          <section className="panel-section rtc-panel" aria-label="RTC 接入">
+            <SectionTitle icon={<RadioTower size={18} />} title="RTC 接入" />
+            <Field label="媒体模式">
+              <select
+                aria-label="媒体模式"
+                disabled={mediaConfigLocked}
+                value={mediaConfig.mode}
+                onChange={(event) => updateMediaConfig("mode", event.target.value)}
+              >
+                <option value="mock">Dev Mock</option>
+                <option value="livekit">LiveKit</option>
+              </select>
+            </Field>
+            {mediaConfig.mode === "livekit" ? (
+              <>
+                <Field label="LiveKit URL">
+                  <input
+                    aria-label="LiveKit URL"
+                    disabled={mediaConfigLocked}
+                    value={mediaConfig.liveKitUrl}
+                    onChange={(event) => updateMediaConfig("liveKitUrl", event.target.value)}
+                    placeholder="wss://your-project.livekit.cloud"
+                  />
+                </Field>
+                <Field label="Participant Token">
+                  <input
+                    aria-label="Participant Token"
+                    disabled={mediaConfigLocked}
+                    value={mediaConfig.liveKitToken}
+                    onChange={(event) => updateMediaConfig("liveKitToken", event.target.value)}
+                    placeholder="由 token service 签发的短期 token"
+                    type="password"
+                  />
+                </Field>
+              </>
+            ) : null}
+            <div className="rtc-status-row">
+              <span>连接状态</span>
+              <MediaStatusBadge state={mediaState} />
+            </div>
+            <p className={mediaState.error ? "rtc-detail rtc-detail-error" : "rtc-detail"}>
+              {mediaState.error ?? mediaState.detail}
+            </p>
+          </section>
+
           <section className="panel-section call-control" aria-label="通话控制">
             <SectionTitle icon={<PhoneCall size={18} />} title="通话控制" />
             <MetricRow label="通话状态" value={<StatusBadge status={status} />} />
             <MetricRow label="通话时长" value={dashboardDuration} />
-            <MetricRow label="呼叫方式" value="AI 外呼" />
+            <MetricRow label="呼叫方式" value="RTC 浏览器音频" />
+            <MetricRow label="RTC 模式" value={mediaConfig.mode === "mock" ? "Dev Mock" : "LiveKit"} />
             <MetricRow label="坐席/机器人" value="AI 助理-小华" />
             <div className="control-actions">
               <button className="secondary-action" type="button" disabled>
@@ -329,6 +496,14 @@ function MetricBlock({ label, value }: { label: string; value: React.ReactNode }
 
 function StatusBadge({ status }: { status: CallStatus }) {
   return <span className={`status-badge status-${status}`}>{getStatusLabel(status)}</span>;
+}
+
+function MediaStatusBadge({ state }: { state: MediaConnectionState }) {
+  return (
+    <span className={`media-status media-status-${state.status}`}>
+      {getMediaStatusLabel(state.status)}
+    </span>
+  );
 }
 
 function ResultSections({ result }: { result?: StructuredResult }) {
@@ -467,6 +642,30 @@ function getStatusLabel(status: CallStatus): string {
   }
 
   return "待开始";
+}
+
+function getMediaStatusLabel(status: MediaConnectionState["status"]): string {
+  if (status === "connecting") {
+    return "连接中";
+  }
+
+  if (status === "connected") {
+    return "已连接";
+  }
+
+  if (status === "failed") {
+    return "连接失败";
+  }
+
+  if (status === "disconnecting") {
+    return "断开中";
+  }
+
+  if (status === "disconnected") {
+    return "已断开";
+  }
+
+  return "未连接";
 }
 
 function getTranscriptTitle(status: CallStatus): string {
