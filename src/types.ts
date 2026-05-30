@@ -13,6 +13,20 @@ export type RiskLevel = "正常" | "敏感" | "无效" | "恶意";
 
 export type TranscriptSpeaker = "client" | "agent";
 
+export type TriageSlotStatus = "collected" | "missing";
+
+export type TriageSlotKey =
+  | "clientName"
+  | "phone"
+  | "caseType"
+  | "city"
+  | "disputeAmount"
+  | "urgency"
+  | "coreNeed"
+  | "hasLawyer"
+  | "expectedContactTime"
+  | "transcript";
+
 export type TranscriptEvent = {
   id: string;
   speaker: TranscriptSpeaker;
@@ -20,7 +34,25 @@ export type TranscriptEvent = {
   timestamp: Date;
 };
 
+export type TriageSlot = {
+  key: TriageSlotKey;
+  label: string;
+  status: TriageSlotStatus;
+  value: string;
+  evidence?: string;
+};
+
+export type TriageSlotSnapshot = {
+  slots: TriageSlot[];
+  missing: TriageSlot[];
+  completedCount: number;
+  totalCount: number;
+  isComplete: boolean;
+  updatedAt: Date;
+};
+
 export type StructuredResult = {
+  triageSlots: TriageSlotSnapshot;
   clientProfile: {
     name: string;
     phone: string;
@@ -56,6 +88,7 @@ export type DemoSession = {
   intake: IntakeForm;
   startedAt: Date;
   transcript: TranscriptEvent[];
+  triageSlots: TriageSlotSnapshot;
   endedAt?: Date;
   structuredResult?: StructuredResult;
 };

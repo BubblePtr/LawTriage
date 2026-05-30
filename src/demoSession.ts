@@ -1,4 +1,16 @@
-import type { DemoSession, IntakeForm, StructuredResult, TranscriptEvent, TranscriptSpeaker } from "./types";
+import {
+  createTriageSlotSnapshot,
+  formatMissingTriageSlots,
+  getTriageSlotValue,
+} from "./triageSlots";
+import type {
+  DemoSession,
+  IntakeForm,
+  StructuredResult,
+  TranscriptEvent,
+  TranscriptSpeaker,
+  TriageSlotSnapshot,
+} from "./types";
 
 const sessionDateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
@@ -70,17 +82,20 @@ export function createDemoSession(intake: IntakeForm): DemoSession {
     intake: { ...intake },
     startedAt: new Date(),
     transcript: [],
+    triageSlots: createTriageSlotSnapshot(intake, []),
   };
 }
 
 export function endDemoSession(session: DemoSession): DemoSession {
   const endedAt = new Date();
+  const triageSlots = createTriageSlotSnapshot(session.intake, session.transcript, endedAt);
 
   return {
     ...session,
     status: "ended",
     endedAt,
-    structuredResult: createStructuredResult(session.intake, session.transcript),
+    triageSlots,
+    structuredResult: createStructuredResult(session.intake, session.transcript, triageSlots),
   };
 }
 
@@ -92,6 +107,7 @@ export function appendTranscriptEvent(session: DemoSession, event: TranscriptEve
   return {
     ...session,
     transcript,
+    triageSlots: createTriageSlotSnapshot(session.intake, transcript),
   };
 }
 
@@ -128,23 +144,32 @@ function createSessionId(): string {
   return `CALL-${date}-${suffix}`;
 }
 
-function createStructuredResult(intake: IntakeForm, transcript: TranscriptEvent[]): StructuredResult {
+function createStructuredResult(
+  intake: IntakeForm,
+  transcript: TranscriptEvent[],
+  triageSlots: TriageSlotSnapshot,
+): StructuredResult {
+  const disputeAmount = getTriageSlotValue(triageSlots, "disputeAmount");
+  const expectedContactTime = getTriageSlotValue(triageSlots, "expectedContactTime");
+  const urgency = getTriageSlotValue(triageSlots, "urgency");
+
   return {
+    triageSlots,
     clientProfile: {
       name: intake.clientName,
       phone: intake.phone,
       caseType: intake.caseType,
       city: intake.city,
-      coreNeed: "婚姻家事初步咨询，需进一步确认财产线索与沟通时间。",
-      hasLawyer: "未确认",
+      coreNeed: getTriageSlotValue(triageSlots, "coreNeed"),
+      hasLawyer: normalizeHasLawyer(getTriageSlotValue(triageSlots, "hasLawyer")),
     },
     grading: {
       level: "中",
-      reason: "演示占位：案件类型明确，信息已留存，标的额和紧急程度待后续分诊槽位补全。",
+      reason: `已收集争议金额/标的：${disputeAmount}；紧急程度：${urgency}。分级规则将在后续切片细化。`,
     },
     appointment: {
       needed: "是",
-      time: "待律师助理回访确认",
+      time: expectedContactTime,
       location: "线上或到所沟通",
     },
     risk: {
@@ -157,10 +182,18 @@ function createStructuredResult(intake: IntakeForm, transcript: TranscriptEvent[
       lineCount: transcript.length,
       summary:
         transcript.length > 0
-          ? "已保留本通演示的完整实时转写，可供后续分诊槽位和录音回放切片复用。"
+          ? `已保留完整实时转写；槽位完成度 ${triageSlots.completedCount}/${triageSlots.totalCount}，缺失字段：${formatMissingTriageSlots(triageSlots)}。`
           : "本通演示未产生转写事件。",
     },
   };
+}
+
+function normalizeHasLawyer(value: string): StructuredResult["clientProfile"]["hasLawyer"] {
+  if (value === "是" || value === "否") {
+    return value;
+  }
+
+  return "未确认";
 }
 
 function formatTranscriptLine(event: TranscriptEvent): string {

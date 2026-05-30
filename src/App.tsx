@@ -30,12 +30,16 @@ import {
   getMockTranscriptLength,
 } from "./demoSession";
 import {
+  formatMissingTriageSlots,
+  getTriageSlotValue,
+} from "./triageSlots";
+import {
   createInitialMediaConfig,
   createInitialMediaState,
   createMediaSessionAdapter,
   validateMediaSessionConfig,
 } from "./mediaSession";
-import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent } from "./types";
+import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent, TriageSlotKey } from "./types";
 import type { AgentRuntimeState } from "./agentPipeline";
 import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } from "./mediaSession";
 
@@ -640,6 +644,17 @@ function ResultSections({ result }: { result?: StructuredResult }) {
         ]}
       />
       <ResultSection
+        icon={<FileText size={18} />}
+        title="分诊槽位"
+        rows={[
+          ["档案完整度", formatSlotCompletion(result)],
+          ["缺失字段", formatMissingResultSlots(result)],
+          ["争议金额/标的", getResultSlotValue(result, "disputeAmount")],
+          ["紧急程度", getResultSlotValue(result, "urgency")],
+          ["期望沟通时间", getResultSlotValue(result, "expectedContactTime")],
+        ]}
+      />
+      <ResultSection
         icon={<CheckCircle2 size={18} />}
         title="案件分级"
         rows={[
@@ -676,6 +691,30 @@ function ResultSections({ result }: { result?: StructuredResult }) {
       />
     </div>
   );
+}
+
+function formatSlotCompletion(result?: StructuredResult): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return `${result.triageSlots.completedCount}/${result.triageSlots.totalCount}`;
+}
+
+function formatMissingResultSlots(result?: StructuredResult): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return formatMissingTriageSlots(result.triageSlots);
+}
+
+function getResultSlotValue(result: StructuredResult | undefined, key: TriageSlotKey): string | undefined {
+  if (!result?.triageSlots) {
+    return undefined;
+  }
+
+  return getTriageSlotValue(result.triageSlots, key);
 }
 
 function TranscriptFeed({ events, status }: { events: TranscriptEvent[]; status: CallStatus }) {
