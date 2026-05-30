@@ -1,6 +1,6 @@
 # 级联 Agent 最小对话链路
 
-Status: ready-for-agent
+Status: completed
 Type: AFK
 
 ## Parent
@@ -27,3 +27,4 @@ Type: AFK
 ## Comments
 
 - 2026-05-30：已完成首轮实现。新增 dev cascaded agent provider bundle（ASR/LLM/TTS 接口）、资深律师接待 system prompt、开场回复和客户文本事件触发的 AI reply。Dev Mock MediaSession 现在只产出客户文本事件，Agent 回复写回 transcript 流；本地浏览器验证可跑通 9 条完整演示对话，并在结束通话后进入结构化结果。
+- 2026-05-30：已同步完成态。验收项全部勾选；最新构建继续通过。

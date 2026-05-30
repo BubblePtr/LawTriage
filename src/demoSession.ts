@@ -3,9 +3,13 @@ import {
   formatMissingTriageSlots,
   getTriageSlotValue,
 } from "./triageSlots";
+import { assessCase } from "./caseAssessment";
+import { createDemoScenarioSnapshot, getDefaultDemoFixture } from "./demoFixtures";
 import type {
+  DemoScenarioSnapshot,
   DemoSession,
   IntakeForm,
+  RecordingArchive,
   StructuredResult,
   TranscriptEvent,
   TranscriptSpeaker,
@@ -28,33 +32,28 @@ const transcriptTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 });
 
-const mockClientTranscriptScript: Array<(intake: IntakeForm) => string> = [
-  (intake) => `你好，我是${intake.clientName}，人在${intake.city}，想咨询离婚和财产分割的问题。`,
-  () => "已经分居三个月，有一套共同房产，还有一个孩子，主要担心对方转移存款。",
-  () => "房子大概四百万，还有几十万存款。我想尽快跟律师聊一下。",
-  () => "可以，那帮我安排明天下午沟通吧。",
-];
+const defaultScenario = createDemoScenarioSnapshot(getDefaultDemoFixture());
 
-export function getMockClientTranscriptLength(): number {
-  return mockClientTranscriptScript.length;
+export function getMockClientTranscriptLength(session: DemoSession): number {
+  return session.scenario.clientTranscript.length;
 }
 
-export function getMockTranscriptLength(): number {
-  return 1 + getMockClientTranscriptLength() * 2;
+export function getMockTranscriptLength(scenario: DemoScenarioSnapshot = defaultScenario): number {
+  return 1 + scenario.clientTranscript.length * 2;
 }
 
 export function createMockClientTranscriptEvent(
-  intake: IntakeForm,
+  session: DemoSession,
   nextIndex: number,
   timestamp = new Date(),
 ): TranscriptEvent | undefined {
-  const scriptLine = mockClientTranscriptScript[nextIndex];
+  const scriptLine = session.scenario.clientTranscript[nextIndex];
 
   if (!scriptLine) {
     return undefined;
   }
 
-  return createTranscriptEvent("client", scriptLine(intake), timestamp, `client-${nextIndex}`);
+  return createTranscriptEvent("client", scriptLine, timestamp, `client-${nextIndex}`);
 }
 
 export function createAgentTranscriptEvent(text: string, timestamp = new Date()): TranscriptEvent {
@@ -75,11 +74,15 @@ function createTranscriptEvent(
   };
 }
 
-export function createDemoSession(intake: IntakeForm): DemoSession {
+export function createDemoSession(
+  intake: IntakeForm,
+  scenario: DemoScenarioSnapshot = defaultScenario,
+): DemoSession {
   return {
     id: createSessionId(),
     status: "active",
     intake: { ...intake },
+    scenario,
     startedAt: new Date(),
     transcript: [],
     triageSlots: createTriageSlotSnapshot(intake, []),
@@ -95,7 +98,7 @@ export function endDemoSession(session: DemoSession): DemoSession {
     status: "ended",
     endedAt,
     triageSlots,
-    structuredResult: createStructuredResult(session.intake, session.transcript, triageSlots),
+    structuredResult: createStructuredResult(session, triageSlots, endedAt),
   };
 }
 
@@ -145,16 +148,18 @@ function createSessionId(): string {
 }
 
 function createStructuredResult(
-  intake: IntakeForm,
-  transcript: TranscriptEvent[],
+  session: DemoSession,
   triageSlots: TriageSlotSnapshot,
+  endedAt: Date,
 ): StructuredResult {
-  const disputeAmount = getTriageSlotValue(triageSlots, "disputeAmount");
+  const intake = session.intake;
+  const transcript = session.transcript;
   const expectedContactTime = getTriageSlotValue(triageSlots, "expectedContactTime");
-  const urgency = getTriageSlotValue(triageSlots, "urgency");
+  const assessment = assessCase(intake, transcript, triageSlots);
 
   return {
     triageSlots,
+    sessionId: session.id,
     clientProfile: {
       name: intake.clientName,
       phone: intake.phone,
@@ -163,19 +168,13 @@ function createStructuredResult(
       coreNeed: getTriageSlotValue(triageSlots, "coreNeed"),
       hasLawyer: normalizeHasLawyer(getTriageSlotValue(triageSlots, "hasLawyer")),
     },
-    grading: {
-      level: "中",
-      reason: `已收集争议金额/标的：${disputeAmount}；紧急程度：${urgency}。分级规则将在后续切片细化。`,
-    },
+    grading: assessment.grading,
     appointment: {
       needed: "是",
       time: expectedContactTime,
       location: "线上或到所沟通",
     },
-    risk: {
-      level: "正常",
-      note: "未触发敏感、无效或恶意咨询规则。",
-    },
+    risk: assessment.risk,
     transcript: {
       events: transcript,
       fullText: transcript.map(formatTranscriptLine).join("\n"),
@@ -185,6 +184,20 @@ function createStructuredResult(
           ? `已保留完整实时转写；槽位完成度 ${triageSlots.completedCount}/${triageSlots.totalCount}，缺失字段：${formatMissingTriageSlots(triageSlots)}。`
           : "本通演示未产生转写事件。",
     },
+    recording: createRecordingArchive(session, endedAt),
+  };
+}
+
+function createRecordingArchive(session: DemoSession, endedAt: Date): RecordingArchive {
+  const durationSeconds = Math.max(1, getSecondsBetween(session.startedAt, endedAt));
+
+  return {
+    id: `REC-${session.id}`,
+    sessionId: session.id,
+    label: `${session.scenario.name} - 演示录音占位`,
+    url: createSilentWavDataUrl(Math.min(durationSeconds, 3)),
+    durationSeconds,
+    createdAt: endedAt,
   };
 }
 
@@ -200,4 +213,45 @@ function formatTranscriptLine(event: TranscriptEvent): string {
   const speaker = event.speaker === "agent" ? "AI 分诊 Agent" : "当事人";
 
   return `[${formatTranscriptTime(event.timestamp)}] ${speaker}: ${event.text}`;
+}
+
+function getSecondsBetween(start: Date, end: Date): number {
+  return Math.max(0, Math.floor((end.getTime() - start.getTime()) / 1000));
+}
+
+function createSilentWavDataUrl(durationSeconds: number): string {
+  const sampleRate = 8000;
+  const sampleCount = Math.max(1, Math.floor(sampleRate * durationSeconds));
+  const bytesPerSample = 2;
+  const dataSize = sampleCount * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
 }

@@ -44,6 +44,6 @@ printf 'VITE_LIVEKIT_URL=%s\nVITE_LIVEKIT_TOKEN=%s\n' "$LIVEKIT_URL" "$TOKEN" > 
 
 ## 当前边界
 
-本切片只建立 `MediaSession` 抽象和浏览器 RTC 接入点。后续 Agent、ASR、TTS、打断和真实 transcript 输入会在后续 issue 中接入。
+演示版已把 `MediaSession` 抽象接入 dev cascaded Agent。`Dev Mock` 会产生客户文本事件，Agent 回复会写回 transcript；`LiveKit` 当前负责浏览器入房和麦克风发布，真实 ASR/TTS 服务仍可通过 provider 层替换。
 
-没有 LiveKit 凭证时，继续使用 `Dev Mock` 模式即可完整验证 issue 01 和 issue 02 的流程。
+没有 LiveKit 凭证时，继续使用 `Dev Mock` 模式即可完整验证演示主流程。
