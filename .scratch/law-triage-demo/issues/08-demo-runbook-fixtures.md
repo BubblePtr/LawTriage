@@ -1,6 +1,6 @@
 # 演示 Runbook 与预设用例
 
-Status: ready-for-agent
+Status: completed
 Type: AFK
 
 ## Parent
@@ -13,13 +13,17 @@ Type: AFK
 
 ## Acceptance criteria
 
-- [ ] 存在标准婚家咨询用例。
-- [ ] 存在含专业追问的用例。
-- [ ] 存在无效/敏感咨询用例。
-- [ ] runbook 覆盖演示前准备、现场操作、失败 fallback 和演示后清理。
-- [ ] 用例字段能直接喂给演示应用或 dev flow。
+- [x] 存在标准婚家咨询用例。
+- [x] 存在含专业追问的用例。
+- [x] 存在无效/敏感咨询用例。
+- [x] runbook 覆盖演示前准备、现场操作、失败 fallback 和演示后清理。
+- [x] 用例字段能直接喂给演示应用或 dev flow。
 
 ## Blocked by
 
 - `.scratch/law-triage-demo/issues/06-case-grading-risk-filter.md`
 - `.scratch/law-triage-demo/issues/07-recording-transcript-archive-playback.md`
+
+## Comments
+
+- 2026-05-30：已完成。新增 `src/demoFixtures.ts` 三条可复演用例，演示应用左侧可直接选择并绑定到 session；新增 `docs/demo-runbook.md`，覆盖准备、标准操作、LiveKit 验证、失败 fallback 和演示后清理。

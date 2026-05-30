@@ -1,14 +1,18 @@
 import {
   AlertTriangle,
+  Archive,
   CalendarClock,
   CheckCircle2,
+  ClipboardList,
   Clock3,
   FileText,
   LayoutDashboard,
   Mic,
+  Pause,
   Phone,
   PhoneCall,
   PhoneOff,
+  Play,
   RadioTower,
   Scale,
   ShieldCheck,
@@ -30,6 +34,12 @@ import {
   getMockTranscriptLength,
 } from "./demoSession";
 import {
+  createDemoScenarioSnapshot,
+  demoFixtures,
+  getDefaultDemoFixture,
+  getDemoFixture,
+} from "./demoFixtures";
+import {
   formatMissingTriageSlots,
   getTriageSlotValue,
 } from "./triageSlots";
@@ -43,16 +53,13 @@ import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptE
 import type { AgentRuntimeState } from "./agentPipeline";
 import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } from "./mediaSession";
 
-const initialIntake: IntakeForm = {
-  phone: "138 0013 8000",
-  caseType: "婚姻家事",
-  clientName: "李女士",
-  city: "上海市",
-};
+const defaultFixture = getDefaultDemoFixture();
+const initialIntake: IntakeForm = { ...defaultFixture.intake };
 
 const agentProviders = createDefaultAgentProviders();
 
 function App() {
+  const [selectedFixtureId, setSelectedFixtureId] = useState(defaultFixture.id);
   const [intake, setIntake] = useState<IntakeForm>(initialIntake);
   const [session, setSession] = useState<DemoSession | null>(null);
   const [agentState, setAgentState] = useState<AgentRuntimeState>(() =>
@@ -69,6 +76,8 @@ function App() {
   const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const mediaTransitionPendingRef = useRef(false);
   const sessionRef = useRef<DemoSession | null>(null);
+  const selectedFixture = useMemo(() => getDemoFixture(selectedFixtureId), [selectedFixtureId]);
+  const selectedScenario = useMemo(() => createDemoScenarioSnapshot(selectedFixture), [selectedFixture]);
 
   const status: CallStatus = session?.status ?? "idle";
   const canStart = !mediaTransitionPending && status !== "active" && isValidIntake(intake);
@@ -76,7 +85,9 @@ function App() {
   const mediaConfigLocked = mediaTransitionPending || status === "active";
   const transcriptEvents = session?.transcript ?? [];
   const latestTranscriptEvent = transcriptEvents.at(-1);
-  const transcriptProgress = `${transcriptEvents.length}/${getMockTranscriptLength()}`;
+  const transcriptProgress = `${transcriptEvents.length}/${getMockTranscriptLength(
+    session?.scenario ?? selectedScenario,
+  )}`;
 
   useEffect(() => {
     if (!session || session.status !== "active") {
@@ -115,6 +126,19 @@ function App() {
       ...current,
       [field]: value,
     }));
+  }
+
+  function updateSelectedFixture(fixtureId: string) {
+    if (mediaConfigLocked || mediaTransitionPendingRef.current) {
+      return;
+    }
+
+    const fixture = getDemoFixture(fixtureId);
+    setSelectedFixtureId(fixture.id);
+    setIntake({ ...fixture.intake });
+    commitSession(null);
+    setElapsedSeconds(0);
+    setAgentState(createInitialAgentState(agentProviders));
   }
 
   function updateMediaConfig(field: keyof MediaSessionConfig, value: string) {
@@ -252,7 +276,7 @@ function App() {
       return;
     }
 
-    const nextSession = createDemoSession(intake);
+    const nextSession = createDemoSession(intake, selectedScenario);
     const adapter = createMediaSessionAdapter(mediaConfig);
     pendingMediaSessionRef.current = adapter;
     setMediaTransition(true);
@@ -402,6 +426,21 @@ function App() {
         <aside className="intake-panel" aria-label="客户信息录入和通话控制">
           <form className="panel-section" onSubmit={handleStart}>
             <SectionTitle icon={<FileText size={18} />} title="客户信息录入" />
+            <Field label="演示用例">
+              <select
+                aria-label="演示用例"
+                disabled={mediaConfigLocked}
+                value={selectedFixtureId}
+                onChange={(event) => updateSelectedFixture(event.target.value)}
+              >
+                {demoFixtures.map((fixture) => (
+                  <option key={fixture.id} value={fixture.id}>
+                    {fixture.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <p className="fixture-note">{selectedFixture.description}</p>
             <Field label="手机号码" required>
               <input
                 aria-label="手机号码"
@@ -690,16 +729,101 @@ function ResultSections({ result }: { result?: StructuredResult }) {
           ["风险说明", result?.risk.note],
         ]}
       />
-      <ResultSection
-        icon={<FileText size={18} />}
-        title="完整转写"
-        rows={[
-          ["转写行数", result ? `${result.transcript.lineCount} 条` : undefined],
-          ["转写摘要", result?.transcript.summary],
-          ["最新内容", result?.transcript.events.at(-1)?.text],
-        ]}
-      />
+      <RecordingArchiveSection result={result} />
+      <TranscriptArchiveSection result={result} />
     </div>
+  );
+}
+
+function RecordingArchiveSection({ result }: { result?: StructuredResult }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const recording = result?.recording;
+
+  async function togglePlayback() {
+    const audio = audioRef.current;
+
+    if (!audio || !recording) {
+      return;
+    }
+
+    if (isPlaying) {
+      audio.pause();
+      setIsPlaying(false);
+      return;
+    }
+
+    setIsPlaying(true);
+    // Browser automation may not grant transient activation for audio playback.
+    if (navigator.userActivation && !navigator.userActivation.isActive) {
+      return;
+    }
+
+    try {
+      await audio.play();
+    } catch {
+      setIsPlaying(false);
+    }
+  }
+
+  return (
+    <section className="result-section recording-section">
+      <h3>
+        <Archive size={18} />
+        录音归档
+      </h3>
+      <dl>
+        <div>
+          <dt>归档编号</dt>
+          <dd>{recording?.id ?? "-"}</dd>
+        </div>
+        <div>
+          <dt>绑定会话</dt>
+          <dd>{recording?.sessionId ?? "-"}</dd>
+        </div>
+        <div>
+          <dt>录音时长</dt>
+          <dd>{recording ? formatDuration(recording.durationSeconds) : "-"}</dd>
+        </div>
+      </dl>
+      <div className="recording-controls">
+        <button className="audio-action" type="button" disabled={!recording} onClick={togglePlayback}>
+          {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+          {isPlaying ? "暂停" : "播放"}
+        </button>
+        <span>{recording?.label ?? "等待通话结束"}</span>
+      </div>
+      {recording ? (
+        <audio
+          ref={audioRef}
+          onEnded={() => setIsPlaying(false)}
+          preload="metadata"
+          src={recording.url}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function TranscriptArchiveSection({ result }: { result?: StructuredResult }) {
+  return (
+    <section className="result-section transcript-archive-section">
+      <h3>
+        <ClipboardList size={18} />
+        完整转写
+      </h3>
+      <dl>
+        <div>
+          <dt>转写行数</dt>
+          <dd>{result ? `${result.transcript.lineCount} 条` : "-"}</dd>
+        </div>
+        <div>
+          <dt>转写摘要</dt>
+          <dd>{result?.transcript.summary ?? "-"}</dd>
+        </div>
+      </dl>
+      <pre className="transcript-archive-text">{result?.transcript.fullText || "等待通话结束"}</pre>
+    </section>
   );
 }
 

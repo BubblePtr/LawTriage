@@ -128,9 +128,9 @@ class MockMediaSessionAdapter implements MediaSessionAdapter {
       return;
     }
 
-    for (let index = 0; index < getMockClientTranscriptLength(); index += 1) {
+    for (let index = 0; index < getMockClientTranscriptLength(session); index += 1) {
       const timer = window.setTimeout(() => {
-        const event = createMockClientTranscriptEvent(session.intake, index);
+        const event = createMockClientTranscriptEvent(session, index);
 
         if (event) {
           handlers.onTranscriptEvent?.(event);

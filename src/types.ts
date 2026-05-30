@@ -15,6 +15,12 @@ export type TranscriptSpeaker = "client" | "agent";
 
 export type TriageSlotStatus = "collected" | "missing";
 
+export type DemoScenarioSnapshot = {
+  id: string;
+  name: string;
+  clientTranscript: string[];
+};
+
 export type TriageSlotKey =
   | "clientName"
   | "phone"
@@ -51,8 +57,18 @@ export type TriageSlotSnapshot = {
   updatedAt: Date;
 };
 
+export type RecordingArchive = {
+  id: string;
+  sessionId: string;
+  label: string;
+  url: string;
+  durationSeconds: number;
+  createdAt: Date;
+};
+
 export type StructuredResult = {
   triageSlots: TriageSlotSnapshot;
+  sessionId: string;
   clientProfile: {
     name: string;
     phone: string;
@@ -80,12 +96,14 @@ export type StructuredResult = {
     lineCount: number;
     summary: string;
   };
+  recording: RecordingArchive;
 };
 
 export type DemoSession = {
   id: string;
   status: Exclude<CallStatus, "idle">;
   intake: IntakeForm;
+  scenario: DemoScenarioSnapshot;
   startedAt: Date;
   transcript: TranscriptEvent[];
   triageSlots: TriageSlotSnapshot;

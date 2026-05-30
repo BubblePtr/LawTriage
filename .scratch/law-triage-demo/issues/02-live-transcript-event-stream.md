@@ -1,6 +1,6 @@
 # 实时字幕事件流
 
-Status: ready-for-agent
+Status: completed
 Type: AFK
 
 ## Parent
@@ -13,11 +13,11 @@ Type: AFK
 
 ## Acceptance criteria
 
-- [ ] session 中存在按时间排序的 transcript 事件。
-- [ ] 字幕能区分当事人与 AI 分诊 Agent。
-- [ ] 创建 session 后可以播放一段模拟对话字幕。
-- [ ] 后台当前会话区域实时展示新增字幕。
-- [ ] 结束 session 后完整转写保留在结构化结果中。
+- [x] session 中存在按时间排序的 transcript 事件。
+- [x] 字幕能区分当事人与 AI 分诊 Agent。
+- [x] 创建 session 后可以播放一段模拟对话字幕。
+- [x] 后台当前会话区域实时展示新增字幕。
+- [x] 结束 session 后完整转写保留在结构化结果中。
 
 ## Blocked by
 
@@ -26,3 +26,4 @@ Type: AFK
 ## Comments
 
 - 2026-05-30：已完成首轮实现。`DemoSession` 现在包含按时间排序的 transcript 事件；创建 session 后会自动播放 9 条模拟对话字幕；当前会话区域区分“当事人”和“AI 分诊 Agent”；结束通话后结构化结果会保留完整转写摘要和行数。已通过 `bun run build`、浏览器交互脚本和结束态截图检查。
+- 2026-05-30：已同步完成态。验收项全部勾选；最新构建继续通过。

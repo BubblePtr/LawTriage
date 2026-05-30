@@ -8,6 +8,7 @@
 - PRD 文件为 `.scratch/<feature-slug>/PRD.md`
 - 实现 issue 放在 `.scratch/<feature-slug>/issues/<NN>-<slug>.md`，从 `01` 开始编号
 - triage 状态写在 issue 文件顶部附近的 `Status:` 行中
+- 实现完成的 issue 使用 `Status: completed`，并勾选对应验收项
 - 评论和讨论历史追加到文件底部的 `## Comments` 小节
 
 ## 当 skill 说“publish to the issue tracker”
