@@ -670,6 +670,15 @@ button {
   background: var(--red);
 }
 
+.media-status-disconnecting {
+  color: #6c5500;
+  background: #fff3d7;
+}
+
+.media-status-disconnecting::before {
+  background: var(--yellow);
+}
+
 .media-status-disconnected {
   color: #5f6870;
   background: #edf1f3;

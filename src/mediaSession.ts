@@ -2,7 +2,13 @@ import type { DemoSession, TranscriptEvent } from "./types";
 
 export type MediaSessionMode = "mock" | "livekit";
 
-export type MediaConnectionStatus = "idle" | "connecting" | "connected" | "failed" | "disconnected";
+export type MediaConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "disconnecting"
+  | "disconnected";
 
 export type MediaSessionConfig = {
   mode: MediaSessionMode;
@@ -24,8 +30,11 @@ export type MediaSessionHandlers = {
 
 export type MediaSessionAdapter = {
   connect: (session: DemoSession, handlers: MediaSessionHandlers) => Promise<void>;
-  disconnect: () => Promise<void>;
+  disconnect: (handlers?: MediaSessionHandlers) => Promise<void>;
 };
+
+type LiveKitRoom = import("livekit-client").Room;
+type LiveKitRoomEvent = typeof import("livekit-client").RoomEvent;
 
 export function createInitialMediaConfig(): MediaSessionConfig {
   return {
@@ -91,13 +100,26 @@ class MockMediaSessionAdapter implements MediaSessionAdapter {
     });
   }
 
-  async disconnect() {
+  async disconnect(handlers?: MediaSessionHandlers) {
+    handlers?.onStateChange({
+      mode: "mock",
+      status: "disconnecting",
+      detail: "正在断开 Dev Mock MediaSession。",
+    });
+
     await wait(120);
+
+    handlers?.onStateChange({
+      mode: "mock",
+      status: "disconnected",
+      detail: "Dev Mock MediaSession 已断开。",
+    });
   }
 }
 
 class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
-  private room?: import("livekit-client").Room;
+  private handlers?: MediaSessionHandlers;
+  private room?: LiveKitRoom;
 
   constructor(private readonly config: MediaSessionConfig) {}
 
@@ -108,16 +130,20 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       detail: `正在连接 LiveKit room：${session.id}`,
     });
 
+    let room: LiveKitRoom | undefined;
+
     try {
-      const { Room } = await import("livekit-client");
-      const room = new Room({
+      const { Room, RoomEvent } = await import("livekit-client");
+      room = new Room({
         adaptiveStream: true,
         dynacast: true,
       });
+      this.room = room;
+      this.handlers = handlers;
+      this.bindRoomLifecycle(room, handlers, RoomEvent);
 
       await room.connect(this.config.liveKitUrl.trim(), this.config.liveKitToken.trim());
       await room.localParticipant.setMicrophoneEnabled(true);
-      this.room = room;
 
       handlers.onStateChange({
         mode: "livekit",
@@ -125,20 +151,117 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
         detail: "LiveKit 已连接，麦克风音轨已发布。",
       });
     } catch (error) {
+      if (room) {
+        room.removeAllListeners();
+        room.disconnect();
+      }
+
+      if (this.room === room) {
+        this.room = undefined;
+      }
+      if (this.handlers === handlers) {
+        this.handlers = undefined;
+      }
+
       handlers.onStateChange({
         mode: "livekit",
-        status: "failed",
-        detail: "LiveKit 连接失败。",
+        status: "disconnected",
+        detail: "LiveKit 连接失败，已断开临时 room。",
         error: getErrorMessage(error),
       });
       throw error;
     }
   }
 
-  async disconnect() {
-    this.room?.disconnect();
-    this.room = undefined;
+  async disconnect(handlers?: MediaSessionHandlers) {
+    const room = this.room;
+    const activeHandlers = handlers ?? this.handlers;
+
+    activeHandlers?.onStateChange({
+      mode: "livekit",
+      status: "disconnecting",
+      detail: "正在断开 LiveKit 媒体连接。",
+    });
+
+    if (room) {
+      this.room = undefined;
+      room.removeAllListeners();
+      room.disconnect();
+    }
+
+    activeHandlers?.onStateChange({
+      mode: "livekit",
+      status: "disconnected",
+      detail: "LiveKit 媒体连接已断开。",
+    });
+
+    this.handlers = undefined;
   }
+
+  private bindRoomLifecycle(room: LiveKitRoom, handlers: MediaSessionHandlers, RoomEvent: LiveKitRoomEvent) {
+    const emitIfCurrent = (state: MediaConnectionState) => {
+      if (this.room !== room) {
+        return;
+      }
+
+      handlers.onStateChange(state);
+    };
+
+    room.on(RoomEvent.Reconnecting, () => {
+      emitIfCurrent({
+        mode: "livekit",
+        status: "connecting",
+        detail: "LiveKit 连接中断，正在重连。",
+      });
+    });
+
+    room.on(RoomEvent.SignalReconnecting, () => {
+      emitIfCurrent({
+        mode: "livekit",
+        status: "connecting",
+        detail: "LiveKit 信令连接中断，正在恢复。",
+      });
+    });
+
+    room.on(RoomEvent.Reconnected, () => {
+      emitIfCurrent({
+        mode: "livekit",
+        status: "connected",
+        detail: "LiveKit 已重连，麦克风音轨保持发布。",
+      });
+    });
+
+    room.on(RoomEvent.Disconnected, (reason) => {
+      if (this.room !== room) {
+        return;
+      }
+
+      this.room = undefined;
+      this.handlers = undefined;
+      handlers.onStateChange({
+        mode: "livekit",
+        status: "disconnected",
+        detail: getLiveKitDisconnectDetail(reason),
+      });
+    });
+
+    room.on(RoomEvent.MediaDevicesError, (error) => {
+      emitIfCurrent({
+        mode: "livekit",
+        status: "failed",
+        detail: "LiveKit 媒体设备发生错误。",
+        error: getErrorMessage(error),
+      });
+    });
+  }
+}
+
+function getLiveKitDisconnectDetail(reason: unknown): string {
+  if (reason === undefined) {
+    return "LiveKit 媒体连接已断开。";
+  }
+
+  return `LiveKit 媒体连接已断开：${String(reason)}。`;
 }
 
 function getErrorMessage(error: unknown): string {

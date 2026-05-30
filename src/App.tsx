@@ -49,11 +49,15 @@ function App() {
   const [mediaState, setMediaState] = useState<MediaConnectionState>(() =>
     createInitialMediaState(createInitialMediaConfig()),
   );
+  const [mediaTransitionPending, setMediaTransitionPending] = useState(false);
   const mediaSessionRef = useRef<MediaSessionAdapter | null>(null);
+  const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
+  const mediaTransitionPendingRef = useRef(false);
 
   const status: CallStatus = session?.status ?? "idle";
-  const canStart = status !== "active" && isValidIntake(intake);
-  const canEnd = status === "active";
+  const canStart = !mediaTransitionPending && status !== "active" && isValidIntake(intake);
+  const canEnd = !mediaTransitionPending && status === "active";
+  const mediaConfigLocked = mediaTransitionPending || status === "active";
   const transcriptEvents = session?.transcript ?? [];
   const latestTranscriptEvent = transcriptEvents.at(-1);
   const transcriptProgress = `${transcriptEvents.length}/${getMockTranscriptLength()}`;
@@ -74,6 +78,7 @@ function App() {
   useEffect(() => {
     return () => {
       void mediaSessionRef.current?.disconnect();
+      void pendingMediaSessionRef.current?.disconnect();
     };
   }, []);
 
@@ -126,6 +131,10 @@ function App() {
   }
 
   function updateMediaConfig(field: keyof MediaSessionConfig, value: string) {
+    if (mediaConfigLocked || mediaTransitionPendingRef.current) {
+      return;
+    }
+
     setMediaConfig((current) => {
       const next = {
         ...current,
@@ -138,10 +147,15 @@ function App() {
     });
   }
 
+  function setMediaTransition(nextPending: boolean) {
+    mediaTransitionPendingRef.current = nextPending;
+    setMediaTransitionPending(nextPending);
+  }
+
   async function handleStart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!canStart) {
+    if (!canStart || mediaTransitionPendingRef.current) {
       return;
     }
 
@@ -159,32 +173,79 @@ function App() {
 
     const nextSession = createDemoSession(intake);
     const adapter = createMediaSessionAdapter(mediaConfig);
-    mediaSessionRef.current = adapter;
+    pendingMediaSessionRef.current = adapter;
+    setMediaTransition(true);
+    setMediaState({
+      mode: mediaConfig.mode,
+      status: "connecting",
+      detail: "正在准备 RTC 媒体连接。",
+    });
 
     try {
       await adapter.connect(nextSession, {
-        onStateChange: setMediaState,
+        onStateChange: (nextState) => {
+          if (pendingMediaSessionRef.current === adapter || mediaSessionRef.current === adapter) {
+            setMediaState(nextState);
+          }
+        },
       });
+      if (pendingMediaSessionRef.current !== adapter) {
+        await adapter.disconnect();
+        return;
+      }
+
+      mediaSessionRef.current = adapter;
+      pendingMediaSessionRef.current = null;
       setSession(nextSession);
       setElapsedSeconds(0);
     } catch {
-      mediaSessionRef.current = null;
+      if (pendingMediaSessionRef.current === adapter) {
+        pendingMediaSessionRef.current = null;
+      }
+      if (mediaSessionRef.current === adapter) {
+        mediaSessionRef.current = null;
+      }
+    } finally {
+      if (pendingMediaSessionRef.current === adapter) {
+        pendingMediaSessionRef.current = null;
+      }
+      setMediaTransition(false);
     }
   }
 
   async function handleEndCall() {
-    if (!session || session.status !== "active") {
+    if (!session || session.status !== "active" || mediaTransitionPendingRef.current) {
       return;
     }
 
-    setSession(endDemoSession(session));
-    await mediaSessionRef.current?.disconnect();
-    mediaSessionRef.current = null;
+    const adapter = mediaSessionRef.current;
+    setMediaTransition(true);
     setMediaState({
       mode: mediaConfig.mode,
-      status: "disconnected",
-      detail: "RTC 媒体连接已断开，转写和结构化结果已保留。",
+      status: "disconnecting",
+      detail: "正在断开 RTC 媒体连接。",
     });
+
+    try {
+      setSession(endDemoSession(session));
+      await adapter?.disconnect({
+        onStateChange: (nextState) => {
+          if (!adapter || mediaSessionRef.current === adapter) {
+            setMediaState(nextState);
+          }
+        },
+      });
+    } finally {
+      if (!adapter || mediaSessionRef.current === adapter) {
+        mediaSessionRef.current = null;
+      }
+      setMediaState({
+        mode: mediaConfig.mode,
+        status: "disconnected",
+        detail: "RTC 媒体连接已断开，转写和结构化结果已保留。",
+      });
+      setMediaTransition(false);
+    }
   }
 
   return (
@@ -257,7 +318,7 @@ function App() {
             <Field label="媒体模式">
               <select
                 aria-label="媒体模式"
-                disabled={status === "active"}
+                disabled={mediaConfigLocked}
                 value={mediaConfig.mode}
                 onChange={(event) => updateMediaConfig("mode", event.target.value)}
               >
@@ -270,7 +331,7 @@ function App() {
                 <Field label="LiveKit URL">
                   <input
                     aria-label="LiveKit URL"
-                    disabled={status === "active"}
+                    disabled={mediaConfigLocked}
                     value={mediaConfig.liveKitUrl}
                     onChange={(event) => updateMediaConfig("liveKitUrl", event.target.value)}
                     placeholder="wss://your-project.livekit.cloud"
@@ -279,7 +340,7 @@ function App() {
                 <Field label="Participant Token">
                   <input
                     aria-label="Participant Token"
-                    disabled={status === "active"}
+                    disabled={mediaConfigLocked}
                     value={mediaConfig.liveKitToken}
                     onChange={(event) => updateMediaConfig("liveKitToken", event.target.value)}
                     placeholder="由 token service 签发的短期 token"
@@ -292,7 +353,7 @@ function App() {
               <span>连接状态</span>
               <MediaStatusBadge state={mediaState} />
             </div>
-            <p className={mediaState.status === "failed" ? "rtc-detail rtc-detail-error" : "rtc-detail"}>
+            <p className={mediaState.error ? "rtc-detail rtc-detail-error" : "rtc-detail"}>
               {mediaState.error ?? mediaState.detail}
             </p>
           </section>
@@ -594,6 +655,10 @@ function getMediaStatusLabel(status: MediaConnectionState["status"]): string {
 
   if (status === "failed") {
     return "连接失败";
+  }
+
+  if (status === "disconnecting") {
+    return "断开中";
   }
 
   if (status === "disconnected") {
