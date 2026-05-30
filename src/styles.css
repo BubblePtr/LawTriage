@@ -316,6 +316,10 @@ button {
   line-height: 1.65;
 }
 
+.operator-note-error {
+  color: var(--red);
+}
+
 .session-panel {
   display: grid;
   grid-template-rows: auto auto 1fr auto;

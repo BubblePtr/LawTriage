@@ -1,3 +1,4 @@
+import { createMockClientTranscriptEvent, getMockClientTranscriptLength } from "./demoSession";
 import type { DemoSession, TranscriptEvent } from "./types";
 
 export type MediaSessionMode = "mock" | "livekit";
@@ -84,7 +85,10 @@ function hasLiveKitDefaults(): boolean {
 }
 
 class MockMediaSessionAdapter implements MediaSessionAdapter {
+  private transcriptTimers: number[] = [];
+
   async connect(session: DemoSession, handlers: MediaSessionHandlers) {
+    this.clearTranscriptTimers();
     handlers.onStateChange({
       mode: "mock",
       status: "connecting",
@@ -98,9 +102,12 @@ class MockMediaSessionAdapter implements MediaSessionAdapter {
       status: "connected",
       detail: "Dev Mock 已接通，浏览器音频链路由模拟字幕事件驱动。",
     });
+
+    this.scheduleTranscriptEvents(session, handlers);
   }
 
   async disconnect(handlers?: MediaSessionHandlers) {
+    this.clearTranscriptTimers();
     handlers?.onStateChange({
       mode: "mock",
       status: "disconnecting",
@@ -114,6 +121,32 @@ class MockMediaSessionAdapter implements MediaSessionAdapter {
       status: "disconnected",
       detail: "Dev Mock MediaSession 已断开。",
     });
+  }
+
+  private scheduleTranscriptEvents(session: DemoSession, handlers: MediaSessionHandlers) {
+    if (!handlers.onTranscriptEvent) {
+      return;
+    }
+
+    for (let index = 0; index < getMockClientTranscriptLength(); index += 1) {
+      const timer = window.setTimeout(() => {
+        const event = createMockClientTranscriptEvent(session.intake, index);
+
+        if (event) {
+          handlers.onTranscriptEvent?.(event);
+        }
+      }, 1500 + index * 3200);
+
+      this.transcriptTimers.push(timer);
+    }
+  }
+
+  private clearTranscriptTimers() {
+    for (const timer of this.transcriptTimers) {
+      window.clearTimeout(timer);
+    }
+
+    this.transcriptTimers = [];
   }
 }
 
