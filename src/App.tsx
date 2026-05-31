@@ -57,6 +57,12 @@ const initialIntake: IntakeForm = { ...defaultFixture.intake };
 
 const agentProviders = createDefaultAgentProviders();
 
+function logAgentFlow(message: string, data?: unknown) {
+  if (import.meta.env.DEV) {
+    console.info(`[LawTriage Agent] ${message}`, data);
+  }
+}
+
 function App() {
   const [selectedFixtureId, setSelectedFixtureId] = useState(defaultFixture.id);
   const [intake, setIntake] = useState<IntakeForm>(initialIntake);
@@ -168,7 +174,7 @@ function App() {
   }
 
   function enqueueMediaTranscriptEvent(event: TranscriptEvent) {
-    console.info("[LawTriage Agent] enqueue transcript", {
+    logAgentFlow("enqueue transcript", {
       speaker: event.speaker,
       text: event.text,
     });
@@ -207,7 +213,7 @@ function App() {
 
     const sessionWithInput = appendTranscriptEvent(latestBeforeInputCommit, acceptedEvent);
     commitSession(sessionWithInput);
-    console.info("[LawTriage Agent] transcript committed", {
+    logAgentFlow("transcript committed", {
       speaker: acceptedEvent.speaker,
       text: acceptedEvent.text,
       transcriptLength: sessionWithInput.transcript.length,
@@ -225,7 +231,7 @@ function App() {
 
     try {
       const turnIndex = sessionWithInput.transcript.filter((item) => item.speaker === "client").length;
-      console.info("[LawTriage Agent] LLM request", {
+      logAgentFlow("LLM request", {
         text: acceptedEvent.text,
         turnIndex,
       });
@@ -235,7 +241,7 @@ function App() {
         transcript: sessionWithInput.transcript,
         turnIndex,
       });
-      console.info("[LawTriage Agent] LLM reply", replyText);
+      logAgentFlow("LLM reply", replyText);
       const latestSession = sessionRef.current;
 
       if (!latestSession || latestSession.status !== "active") {
@@ -248,7 +254,7 @@ function App() {
         detail: "Agent 回复已生成，正在写回字幕流。",
       });
       await agentProviders.tts.synthesize(replyText);
-      console.info("[LawTriage Agent] TTS played");
+      logAgentFlow("TTS played");
 
       const sessionWithReply = appendTranscriptEvent(
         latestSession,

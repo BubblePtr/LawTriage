@@ -255,25 +255,41 @@ async function playSpeechBlob(blob: Blob): Promise<void> {
   window.dispatchEvent(new Event("lawtriage:tts-start"));
 
   try {
-    await new Promise<void>((resolve) => {
-      const finish = () => {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
         audio.onended = null;
         audio.onerror = null;
+      };
+
+      const finish = () => {
+        cleanup();
         resolve();
+      };
+      const fail = (error: unknown) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error("TTS 音频播放失败。"));
       };
 
       audio.onended = finish;
-      audio.onerror = finish;
+      audio.onerror = () => fail(new Error(getAudioPlaybackErrorMessage(audio.error)));
       const playPromise = audio.play();
 
       if (playPromise) {
-        playPromise.catch(finish);
+        playPromise.catch(fail);
       }
     });
   } finally {
     window.dispatchEvent(new Event("lawtriage:tts-end"));
     URL.revokeObjectURL(url);
   }
+}
+
+function getAudioPlaybackErrorMessage(error: MediaError | null): string {
+  if (!error) {
+    return "TTS 音频播放失败。";
+  }
+
+  return error.message || `TTS 音频播放失败，错误码：${error.code}。`;
 }
 
 function createDevLlmProvider(): LlmProvider {

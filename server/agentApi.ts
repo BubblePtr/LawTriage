@@ -38,6 +38,14 @@ const defaultVolcAsrResourceId = "volc.seedasr.sauc.duration";
 const defaultVolcAsrStreamWsUrl = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async";
 const defaultVolcTtsResourceId = "seed-tts-2.0";
 const defaultVolcTtsUrl = "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+const maxRequestBodyBytes = 16 * 1024 * 1024;
+const upstreamTimeoutMs = 45_000;
+
+class RequestBodyTooLargeError extends Error {
+  constructor(readonly limitBytes: number) {
+    super(`请求体超过 ${formatBytes(limitBytes)} 上限。`);
+  }
+}
 
 export function agentApiPlugin(env: AgentApiEnv): Plugin {
   return {
@@ -83,6 +91,12 @@ function installAgentApiMiddleware(middlewares: Connect.Server, env: AgentApiEnv
 
       sendJson(res, 404, { error: "未知 Agent API。" });
     } catch (error) {
+      if (error instanceof RequestBodyTooLargeError) {
+        res.setHeader("Connection", "close");
+        sendJson(res, 413, { error: error.message });
+        return;
+      }
+
       sendJson(res, 500, { error: getErrorMessage(error) });
     }
   });
@@ -122,8 +136,8 @@ async function handleReply(req: IncomingMessage, res: ServerResponse, env: Agent
   const body = (await readJson(req)) as AgentReplyPayload;
   const provider = getProviderMode(env);
   console.info("[LawTriage Agent API] reply request", {
-    clientText: body.clientEvent?.text ?? "",
     provider,
+    transcript: createTranscriptLogMeta(body.clientEvent?.text),
     turnIndex: body.turnIndex ?? 0,
   });
 
@@ -202,7 +216,7 @@ async function handleTranscribe(req: IncomingMessage, res: ServerResponse, env: 
 
 async function createOpenAiReply(body: AgentReplyPayload, env: AgentApiEnv): Promise<string> {
   const apiKey = requireEnv(env.OPENAI_API_KEY, "OPENAI_API_KEY");
-  const upstream = await fetch("https://api.openai.com/v1/responses", {
+  const upstream = await fetchWithTimeout("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: createBearerJsonHeaders(apiKey),
     body: JSON.stringify({
@@ -219,7 +233,7 @@ async function createOpenAiReply(body: AgentReplyPayload, env: AgentApiEnv): Pro
 
 async function createOpenAiSpeech(input: string, env: AgentApiEnv): Promise<Buffer> {
   const apiKey = requireEnv(env.OPENAI_API_KEY, "OPENAI_API_KEY");
-  const upstream = await fetch("https://api.openai.com/v1/audio/speech", {
+  const upstream = await fetchWithTimeout("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: createBearerJsonHeaders(apiKey),
     body: JSON.stringify({
@@ -251,7 +265,7 @@ async function createOpenAiTranscription(
   form.set("model", env.OPENAI_ASR_MODEL || defaultOpenAiAsrModel);
   form.set("response_format", "json");
 
-  const upstream = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+  const upstream = await fetchWithTimeout("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -266,7 +280,7 @@ async function createOpenAiTranscription(
 async function createVolcArkReply(body: AgentReplyPayload, env: AgentApiEnv): Promise<string> {
   const apiKey = requireEnv(env.ARK_API_KEY, "ARK_API_KEY");
   const model = requireEnv(env.ARK_MODEL, "ARK_MODEL");
-  const upstream = await fetch(`${trimTrailingSlash(env.ARK_BASE_URL || defaultArkBaseUrl)}/chat/completions`, {
+  const upstream = await fetchWithTimeout(`${trimTrailingSlash(env.ARK_BASE_URL || defaultArkBaseUrl)}/chat/completions`, {
     method: "POST",
     headers: createBearerJsonHeaders(apiKey),
     body: JSON.stringify({
@@ -293,7 +307,7 @@ async function createVolcArkReply(body: AgentReplyPayload, env: AgentApiEnv): Pr
 async function createVolcSpeech(input: string, env: AgentApiEnv): Promise<Buffer> {
   const apiKey = requireEnv(env.VOLC_TTS_API_KEY, "VOLC_TTS_API_KEY");
   const voiceType = requireEnv(env.VOLC_TTS_VOICE_TYPE, "VOLC_TTS_VOICE_TYPE");
-  const upstream = await fetch(env.VOLC_TTS_URL || defaultVolcTtsUrl, {
+  const upstream = await fetchWithTimeout(env.VOLC_TTS_URL || defaultVolcTtsUrl, {
     method: "POST",
     headers: {
       "Connection": "keep-alive",
@@ -388,7 +402,7 @@ function connectVolcAsrRelay(client: WebSocket, env: AgentApiEnv) {
           }
 
           emittedUtterances.add(key);
-          console.info("[LawTriage ASR relay] definite result", text);
+          console.info("[LawTriage ASR relay] definite result", createTranscriptLogMeta(text));
           sendClientAsrJson(client, {
             definite: true,
             endTime: utterance.endTime,
@@ -836,10 +850,60 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 function readBuffer(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
 
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    const cleanup = () => {
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+    };
+
+    const settleReject = (error: Error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      req.pause();
+      reject(error);
+    };
+
+    const onData = (chunk: Buffer) => {
+      totalBytes += chunk.byteLength;
+
+      if (totalBytes > maxRequestBodyBytes) {
+        settleReject(new RequestBodyTooLargeError(maxRequestBodyBytes));
+        return;
+      }
+
+      chunks.push(chunk);
+    };
+
+    const onEnd = () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks, totalBytes));
+    };
+
+    const onError = (error: Error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
   });
 }
 
@@ -877,8 +941,52 @@ function getSingleHeader(value: string | string[]): string {
   return Array.isArray(value) ? value[0] : value;
 }
 
+async function fetchWithTimeout(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`上游 Agent provider 请求超过 ${Math.round(upstreamTimeoutMs / 1000)} 秒。`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function createTranscriptLogMeta(text: string | undefined) {
+  const normalized = text?.replace(/\s+/g, " ").trim() ?? "";
+
+  return {
+    chars: normalized.length,
+    redactedPreview: redactTranscriptPreview(normalized),
+  };
+}
+
+function redactTranscriptPreview(text: string): string {
+  return text
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]")
+    .replace(/\d/g, "*")
+    .replace(/[\u4e00-\u9fff]/g, "*")
+    .slice(0, 32);
+}
+
+function formatBytes(bytes: number): string {
+  return `${Math.round(bytes / 1024 / 1024)}MB`;
 }
 
 function getErrorMessage(error: unknown): string {

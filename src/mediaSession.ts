@@ -175,8 +175,19 @@ class BrowserMicMediaSessionAdapter implements MediaSessionAdapter {
       detail: `正在打开本机麦克风：${session.id}`,
     });
 
-    this.audioTranscription = new BrowserAudioTranscriptionSession("browser");
-    await this.audioTranscription.start(handlers);
+    const audioTranscription = new BrowserAudioTranscriptionSession("browser");
+    this.audioTranscription = audioTranscription;
+
+    try {
+      await audioTranscription.start(handlers);
+    } catch (error) {
+      if (this.audioTranscription === audioTranscription) {
+        audioTranscription.stop();
+        this.audioTranscription = undefined;
+      }
+
+      throw error;
+    }
 
     handlers.onStateChange({
       mode: "browser",
@@ -416,7 +427,7 @@ class BrowserAudioTranscriptionSession {
     window.addEventListener("lawtriage:tts-start", this.handleTtsStart);
     window.addEventListener("lawtriage:tts-end", this.handleTtsEnd);
     this.stopped = false;
-    this.ttsActive = getAgentProviderMode() !== "dev";
+    this.ttsActive = false;
 
     if (getAgentProviderMode() === "volcengine") {
       await this.startVolcStreamingAsr(handlers);
@@ -649,6 +660,10 @@ class BrowserAudioTranscriptionSession {
   }
 
   private handleVolcAsrMessage(data: unknown, handlers: MediaSessionHandlers) {
+    if (this.stopped) {
+      return;
+    }
+
     const message = parseAsrSocketMessage(data);
 
     if (message.type === "error") {
@@ -868,6 +883,10 @@ class BrowserAudioTranscriptionSession {
     this.processing = this.processing
       .then(() => this.transcribe(blob, handlers))
       .catch((error) => {
+        if (this.stopped) {
+          return;
+        }
+
         handlers.onStateChange({
           mode: this.mode,
           status: "failed",
@@ -886,11 +905,26 @@ class BrowserAudioTranscriptionSession {
       body: blob,
     });
 
+    if (this.stopped) {
+      return;
+    }
+
     if (!response.ok) {
-      throw new Error(await readAgentApiError(response, "ASR 请求失败。"));
+      const errorMessage = await readAgentApiError(response, "ASR 请求失败。");
+
+      if (this.stopped) {
+        return;
+      }
+
+      throw new Error(errorMessage);
     }
 
     const payload = (await response.json()) as { text?: string };
+
+    if (this.stopped) {
+      return;
+    }
+
     const text = normalizeTranscriptText(payload.text);
 
     if (!text || text === this.lastText) {
@@ -898,6 +932,10 @@ class BrowserAudioTranscriptionSession {
     }
 
     this.lastText = text;
+    if (this.stopped) {
+      return;
+    }
+
     handlers.onTranscriptEvent?.({
       id: `tr-${Date.now()}-asr-${Math.random().toString(16).slice(2, 6)}`,
       speaker: "client",
