@@ -1,6 +1,7 @@
 import type { DemoSession, TranscriptEvent } from "./types";
+import { legalReceptionSystemPrompt } from "./agentPrompt";
 
-export type AgentProviderKind = "dev" | "external";
+export type AgentProviderKind = "dev" | "openai" | "volcengine";
 
 export type AgentRuntimeStatus = "idle" | "listening" | "thinking" | "speaking" | "failed";
 
@@ -45,15 +46,25 @@ export type AgentProviderBundle = {
   tts: TtsProvider;
 };
 
-export const legalReceptionSystemPrompt = [
-  "你是华诚律师事务所的 AI 分诊接待助理小华，只处理婚姻家事初步接待。",
-  "开场要说明身份和登记目的，不承诺具体法律结论。",
-  "客户表达压力或担忧时先共情，再追问分诊所需事实。",
-  "追问优先覆盖分居状态、子女抚养、共同房产、存款和财产转移风险。",
-  "收尾时给出预约建议、材料准备方向，并说明律师助理会回访确认。",
-].join("\n");
-
 export function createDefaultAgentProviders(): AgentProviderBundle {
+  if (getAgentProviderMode() === "volcengine") {
+    return {
+      asr: createVolcengineAsrProvider(),
+      label: "Volcengine Cascaded Agent",
+      llm: createVolcengineLlmProvider(),
+      tts: createVolcengineTtsProvider(),
+    };
+  }
+
+  if (getAgentProviderMode() === "openai") {
+    return {
+      asr: createOpenAiAsrProvider(),
+      label: "OpenAI Cascaded Agent",
+      llm: createOpenAiLlmProvider(),
+      tts: createOpenAiTtsProvider(),
+    };
+  }
+
   return {
     asr: createDevAsrProvider(),
     label: "Dev Cascaded Agent",
@@ -62,11 +73,129 @@ export function createDefaultAgentProviders(): AgentProviderBundle {
   };
 }
 
+export function getAgentProviderMode(): AgentProviderKind {
+  if (import.meta.env.VITE_AGENT_PROVIDER === "volcengine") {
+    return "volcengine";
+  }
+
+  return import.meta.env.VITE_AGENT_PROVIDER === "openai" ? "openai" : "dev";
+}
+
 export function createInitialAgentState(providers: AgentProviderBundle): AgentRuntimeState {
   return {
     providerLabel: providers.label,
     status: "idle",
     detail: "Agent 已就绪，等待媒体文本事件。",
+  };
+}
+
+function createOpenAiAsrProvider(): AsrProvider {
+  return {
+    kind: "openai",
+    label: "OpenAI Audio Transcription",
+    async acceptTextEvent(event) {
+      return event;
+    },
+  };
+}
+
+function createOpenAiLlmProvider(): LlmProvider {
+  return {
+    kind: "openai",
+    label: "OpenAI Responses",
+    systemPrompt: legalReceptionSystemPrompt,
+    async generateReply(request) {
+      const response = await postJson<{ text: string }>("/api/agent/reply", {
+        clientEvent: serializeTranscriptEvent(request.clientEvent),
+        session: {
+          id: request.session.id,
+          intake: request.session.intake,
+          startedAt: request.session.startedAt.toISOString(),
+        },
+        systemPrompt: legalReceptionSystemPrompt,
+        transcript: request.transcript.map(serializeTranscriptEvent),
+        turnIndex: request.turnIndex,
+      });
+
+      return response.text;
+    },
+  };
+}
+
+function createOpenAiTtsProvider(): TtsProvider {
+  return {
+    kind: "openai",
+    label: "OpenAI Speech",
+    async synthesize(text) {
+      const response = await fetch("/api/agent/speech", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "OpenAI TTS 请求失败。"));
+      }
+
+      await playSpeechBlob(await response.blob());
+    },
+  };
+}
+
+function createVolcengineAsrProvider(): AsrProvider {
+  return {
+    kind: "volcengine",
+    label: "Volcengine Seed ASR",
+    async acceptTextEvent(event) {
+      return event;
+    },
+  };
+}
+
+function createVolcengineLlmProvider(): LlmProvider {
+  return {
+    kind: "volcengine",
+    label: "Volcengine Ark",
+    systemPrompt: legalReceptionSystemPrompt,
+    async generateReply(request) {
+      const response = await postJson<{ text: string }>("/api/agent/reply", {
+        clientEvent: serializeTranscriptEvent(request.clientEvent),
+        session: {
+          id: request.session.id,
+          intake: request.session.intake,
+          startedAt: request.session.startedAt.toISOString(),
+        },
+        systemPrompt: legalReceptionSystemPrompt,
+        transcript: request.transcript.map(serializeTranscriptEvent),
+        turnIndex: request.turnIndex,
+      });
+
+      return response.text;
+    },
+  };
+}
+
+function createVolcengineTtsProvider(): TtsProvider {
+  return {
+    kind: "volcengine",
+    label: "Volcengine Seed TTS",
+    async synthesize(text) {
+      const response = await fetch("/api/agent/speech", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "火山 TTS 请求失败。"));
+      }
+
+      await playSpeechBlob(await response.blob());
+    },
   };
 }
 
@@ -78,6 +207,89 @@ function createDevAsrProvider(): AsrProvider {
       return event;
     },
   };
+}
+
+function serializeTranscriptEvent(event?: TranscriptEvent) {
+  if (!event) {
+    return undefined;
+  }
+
+  return {
+    id: event.id,
+    speaker: event.speaker,
+    text: event.text,
+    timestamp: event.timestamp.toISOString(),
+  };
+}
+
+async function postJson<T>(url: string, payload: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response, "Agent provider 请求失败。"));
+  }
+
+  return response.json() as Promise<T>;
+}
+
+async function readErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = (await response.json()) as { error?: string };
+
+    return payload.error ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function playSpeechBlob(blob: Blob): Promise<void> {
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+
+  window.dispatchEvent(new Event("lawtriage:tts-start"));
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        audio.onended = null;
+        audio.onerror = null;
+      };
+
+      const finish = () => {
+        cleanup();
+        resolve();
+      };
+      const fail = (error: unknown) => {
+        cleanup();
+        reject(error instanceof Error ? error : new Error("TTS 音频播放失败。"));
+      };
+
+      audio.onended = finish;
+      audio.onerror = () => fail(new Error(getAudioPlaybackErrorMessage(audio.error)));
+      const playPromise = audio.play();
+
+      if (playPromise) {
+        playPromise.catch(fail);
+      }
+    });
+  } finally {
+    window.dispatchEvent(new Event("lawtriage:tts-end"));
+    URL.revokeObjectURL(url);
+  }
+}
+
+function getAudioPlaybackErrorMessage(error: MediaError | null): string {
+  if (!error) {
+    return "TTS 音频播放失败。";
+  }
+
+  return error.message || `TTS 音频播放失败，错误码：${error.code}。`;
 }
 
 function createDevLlmProvider(): LlmProvider {

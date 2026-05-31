@@ -14,7 +14,6 @@ import {
   PhoneOff,
   Play,
   RadioTower,
-  Scale,
   ShieldCheck,
   UserRound,
 } from "lucide-react";
@@ -57,6 +56,12 @@ const defaultFixture = getDefaultDemoFixture();
 const initialIntake: IntakeForm = { ...defaultFixture.intake };
 
 const agentProviders = createDefaultAgentProviders();
+
+function logAgentFlow(message: string, data?: unknown) {
+  if (import.meta.env.DEV) {
+    console.info(`[LawTriage Agent] ${message}`, data);
+  }
+}
 
 function App() {
   const [selectedFixtureId, setSelectedFixtureId] = useState(defaultFixture.id);
@@ -169,6 +174,10 @@ function App() {
   }
 
   function enqueueMediaTranscriptEvent(event: TranscriptEvent) {
+    logAgentFlow("enqueue transcript", {
+      speaker: event.speaker,
+      text: event.text,
+    });
     const turn = agentTurnQueueRef.current
       .then(() => processMediaTranscriptEvent(event))
       .catch((error) => {
@@ -204,6 +213,11 @@ function App() {
 
     const sessionWithInput = appendTranscriptEvent(latestBeforeInputCommit, acceptedEvent);
     commitSession(sessionWithInput);
+    logAgentFlow("transcript committed", {
+      speaker: acceptedEvent.speaker,
+      text: acceptedEvent.text,
+      transcriptLength: sessionWithInput.transcript.length,
+    });
 
     if (acceptedEvent.speaker !== "client") {
       return;
@@ -217,12 +231,17 @@ function App() {
 
     try {
       const turnIndex = sessionWithInput.transcript.filter((item) => item.speaker === "client").length;
+      logAgentFlow("LLM request", {
+        text: acceptedEvent.text,
+        turnIndex,
+      });
       const replyText = await agentProviders.llm.generateReply({
         clientEvent: acceptedEvent,
         session: sessionWithInput,
         transcript: sessionWithInput.transcript,
         turnIndex,
       });
+      logAgentFlow("LLM reply", replyText);
       const latestSession = sessionRef.current;
 
       if (!latestSession || latestSession.status !== "active") {
@@ -235,6 +254,7 @@ function App() {
         detail: "Agent 回复已生成，正在写回字幕流。",
       });
       await agentProviders.tts.synthesize(replyText);
+      logAgentFlow("TTS played");
 
       const sessionWithReply = appendTranscriptEvent(
         latestSession,
@@ -402,24 +422,35 @@ function App() {
 
   return (
     <main className="app-shell">
-      <TopBar />
       <nav className="workspace-nav" aria-label="主导航">
-        <a className="nav-item nav-item-active" href="#workspace">
-          <LayoutDashboard size={16} />
-          工作台
-        </a>
-        <a className="nav-item" href="#call">
-          <PhoneCall size={16} />
-          通话记录
-        </a>
-        <a className="nav-item" href="#profile">
-          <UserRound size={16} />
-          客户档案
-        </a>
-        <a className="nav-item" href="#result">
-          <FileText size={16} />
-          结果导出
-        </a>
+        <div className="nav-links">
+          <a className="nav-item nav-item-active" href="#workspace">
+            <LayoutDashboard size={16} />
+            工作台
+          </a>
+          <a className="nav-item" href="#call">
+            <PhoneCall size={16} />
+            通话记录
+          </a>
+          <a className="nav-item" href="#profile">
+            <UserRound size={16} />
+            客户档案
+          </a>
+          <a className="nav-item" href="#result">
+            <FileText size={16} />
+            结果导出
+          </a>
+        </div>
+        <div className="top-actions nav-status" aria-label="系统状态">
+          <span className="online-dot">
+            <span />
+            系统在线
+          </span>
+          <span className="clock-label">
+            <Clock3 size={16} />
+            演示工作台
+          </span>
+        </div>
       </nav>
 
       <section className="workspace" id="workspace">
@@ -480,8 +511,8 @@ function App() {
             </button>
           </form>
 
-          <section className="panel-section rtc-panel" aria-label="RTC 接入">
-            <SectionTitle icon={<RadioTower size={18} />} title="RTC 接入" />
+          <section className="panel-section rtc-panel" aria-label="媒体接入">
+            <SectionTitle icon={<RadioTower size={18} />} title="媒体接入" />
             <Field label="媒体模式">
               <select
                 aria-label="媒体模式"
@@ -490,6 +521,7 @@ function App() {
                 onChange={(event) => updateMediaConfig("mode", event.target.value)}
               >
                 <option value="mock">Dev Mock</option>
+                <option value="browser">本机麦克风</option>
                 <option value="livekit">LiveKit</option>
               </select>
             </Field>
@@ -529,8 +561,8 @@ function App() {
             <SectionTitle icon={<PhoneCall size={18} />} title="通话控制" />
             <MetricRow label="通话状态" value={<StatusBadge status={status} />} />
             <MetricRow label="通话时长" value={dashboardDuration} />
-            <MetricRow label="呼叫方式" value="RTC 浏览器音频" />
-            <MetricRow label="RTC 模式" value={mediaConfig.mode === "mock" ? "Dev Mock" : "LiveKit"} />
+            <MetricRow label="呼叫方式" value={getCallMediaLabel(mediaConfig.mode)} />
+            <MetricRow label="媒体模式" value={getMediaModeLabel(mediaConfig.mode)} />
             <MetricRow label="Agent 模式" value={agentState.providerLabel} />
             <MetricRow label="Agent 状态" value={getAgentStatusLabel(agentState.status)} />
             <MetricRow label="坐席/机器人" value="AI 助理-小华" />
@@ -592,32 +624,6 @@ function App() {
   );
 }
 
-function TopBar() {
-  return (
-    <header className="top-bar">
-      <div className="brand">
-        <div className="brand-mark">
-          <Scale size={20} />
-        </div>
-        <div>
-          <strong>华诚律师事务所</strong>
-          <span>AI 外呼接待演示系统（MVP）</span>
-        </div>
-      </div>
-      <div className="top-actions">
-        <span className="online-dot">
-          <span />
-          系统在线
-        </span>
-        <span className="clock-label">
-          <Clock3 size={16} />
-          演示工作台
-        </span>
-      </div>
-    </header>
-  );
-}
-
 function SectionTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
   return (
     <h2 className="section-title">
@@ -675,6 +681,26 @@ function MediaStatusBadge({ state }: { state: MediaConnectionState }) {
       {getMediaStatusLabel(state.status)}
     </span>
   );
+}
+
+function getMediaModeLabel(mode: MediaSessionConfig["mode"]): string {
+  if (mode === "browser") {
+    return "本机麦克风";
+  }
+
+  return mode === "livekit" ? "LiveKit" : "Dev Mock";
+}
+
+function getCallMediaLabel(mode: MediaSessionConfig["mode"]): string {
+  if (mode === "mock") {
+    return "模拟文本事件";
+  }
+
+  if (mode === "browser") {
+    return "浏览器本机音频";
+  }
+
+  return "LiveKit RTC 音频";
 }
 
 function ResultSections({ result }: { result?: StructuredResult }) {

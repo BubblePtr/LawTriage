@@ -10,7 +10,8 @@
 - 本地启动：`bun run dev`
 - 默认使用 `Dev Mock` 媒体模式，不需要外部 RTC 凭证。
 - 如需验证 LiveKit，先按 `docs/rtc.md` 写入 `.env.local`，再重启 Vite。
-- 准备浏览器麦克风授权；LiveKit 模式下需要允许麦克风。
+- 如需验证真实 ASR/LLM/TTS，设置 `VITE_AGENT_PROVIDER=volcengine` 并按 `docs/rtc.md` 填入火山服务端环境变量，再重启 Vite。
+- 准备浏览器麦克风授权；`本机麦克风` 和 `LiveKit` 模式下需要允许麦克风。
 
 ## 预设用例
 
@@ -47,10 +48,20 @@
 4. 点击“开始咨询”，浏览器允许麦克风。
 5. 确认 RTC 状态进入“已连接”，并在失败时检查 UI 展示的明确错误。
 
+## 真实级联 Provider 验证路径
+
+1. 按 `docs/rtc.md` 配置 `VITE_AGENT_PROVIDER=volcengine`、火山方舟、豆包 ASR 和豆包 TTS 环境变量。
+2. 重启 `bun run dev`。
+3. 媒体模式选择 `本机麦克风`，点击“开始咨询”后允许浏览器麦克风。
+4. 先用 `/api/agent/reply` 和 `/api/agent/speech` 验证火山方舟回复和豆包 TTS 播报。
+5. ASR 会通过本地 `/api/agent/asr` WebSocket relay 接入火山大模型流式语音识别；不要用录音文件极速版替代实时链路。
+6. 点击“结束通话”，检查右侧结构化档案仍按 transcript/result 链路生成。
+
 ## 失败 Fallback
 
 - LiveKit token 过期或 URL 不正确：切回 `Dev Mock`，继续完成演示主路径。
-- 浏览器麦克风授权失败：刷新页面后重新授权；仍失败时使用 `Dev Mock`。
+- 火山 API key、音色或资源 ID 未开通：切回 `VITE_AGENT_PROVIDER=dev` 并重启 dev server，继续使用稳定演示链路。新版控制台只需要 API Key，不需要旧版 App Key / Access Key。
+- 浏览器麦克风授权失败：刷新页面后重新授权；仍失败时切回 `Dev Mock` 验证稳定演示主路径。
 - Agent 对话未继续追加：结束当前通话，重新选择用例并开始新 session。
 - 风险标记不符合预期：切换到 `sensitive-safety` 用例验证敏感规则；如需无效或恶意示例，可在 `src/demoFixtures.ts` 临时新增包含规则关键词的 transcript。
 - 播放按钮无声：当前为演示占位静音音频，只用于验证归档和播放控制，不代表真实 RTC 录音。
