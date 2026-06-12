@@ -4,13 +4,18 @@ import type { Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 import WebSocket, { type RawData, WebSocketServer } from "ws";
+import {
+  createLiveKitParticipantToken,
+  type LiveKitParticipantTokenRequest,
+  type LiveKitTokenEnv,
+} from "./livekitToken";
 
 type AgentProviderMode = "dev" | "openai" | "volcengine";
 type UpgradeCapableServer = {
   on(event: "upgrade", listener: (req: IncomingMessage, socket: Socket, head: Buffer) => void): unknown;
 };
 
-type AgentApiEnv = {
+export type AgentApiEnv = LiveKitTokenEnv & {
   ARK_API_KEY?: string;
   ARK_BASE_URL?: string;
   ARK_MODEL?: string;
@@ -19,6 +24,10 @@ type AgentApiEnv = {
   OPENAI_LLM_MODEL?: string;
   OPENAI_TTS_MODEL?: string;
   OPENAI_TTS_VOICE?: string;
+  LIVEKIT_AGENT_ASR_TURN_SILENCE_MS?: string;
+  LIVEKIT_AGENT_FORWARD_AUDIO_IDLE_TIMEOUT_MS?: string;
+  LIVEKIT_AGENT_TTS_CHUNK_MAX_CHARS?: string;
+  LIVEKIT_AGENT_TTS_READ_IDLE_TIMEOUT_MS?: string;
   VITE_AGENT_PROVIDER?: string;
   VOLC_ASR_API_KEY?: string;
   VOLC_ASR_RESOURCE_ID?: string;
@@ -63,6 +72,20 @@ export function agentApiPlugin(env: AgentApiEnv): Plugin {
 
 function installAgentApiMiddleware(middlewares: Connect.Server, env: AgentApiEnv) {
   middlewares.use(async (req, res, next) => {
+    if (req.url?.startsWith("/api/livekit/token")) {
+      try {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { error: "只支持 POST 请求。" });
+          return;
+        }
+
+        await handleLiveKitToken(req, res, env);
+      } catch (error) {
+        sendJson(res, 500, { error: getErrorMessage(error) });
+      }
+      return;
+    }
+
     if (!req.url?.startsWith("/api/agent/")) {
       next();
       return;
@@ -100,6 +123,17 @@ function installAgentApiMiddleware(middlewares: Connect.Server, env: AgentApiEnv
       sendJson(res, 500, { error: getErrorMessage(error) });
     }
   });
+}
+
+async function handleLiveKitToken(req: IncomingMessage, res: ServerResponse, env: AgentApiEnv) {
+  const body = (await readJson(req)) as LiveKitParticipantTokenRequest;
+  const token = createLiveKitParticipantToken(body, env);
+  console.info("[LawTriage LiveKit token] issued browser participant token", {
+    expiresAt: token.expiresAt,
+    identity: token.identity,
+    roomName: token.roomName,
+  });
+  sendJson(res, 200, token);
 }
 
 function installAgentAsrWebSocket(httpServer: UpgradeCapableServer | null, env: AgentApiEnv) {
@@ -277,26 +311,37 @@ async function createOpenAiTranscription(
   return typeof payload.text === "string" ? payload.text.trim() : "";
 }
 
-async function createVolcArkReply(body: AgentReplyPayload, env: AgentApiEnv): Promise<string> {
+export async function createVolcArkReply(body: AgentReplyPayload, env: AgentApiEnv): Promise<string> {
+  return createVolcArkChatCompletion(
+    [
+      {
+        role: "system",
+        content: buildReplyInstructions(body.systemPrompt),
+      },
+      {
+        role: "user",
+        content: buildReplyInput(body),
+      },
+    ],
+    env,
+  );
+}
+
+export async function createVolcArkChatCompletion(
+  messages: ArkChatMessage[],
+  env: AgentApiEnv,
+  options: { maxTokens?: number; temperature?: number } = {},
+): Promise<string> {
   const apiKey = requireEnv(env.ARK_API_KEY, "ARK_API_KEY");
   const model = requireEnv(env.ARK_MODEL, "ARK_MODEL");
   const upstream = await fetchWithTimeout(`${trimTrailingSlash(env.ARK_BASE_URL || defaultArkBaseUrl)}/chat/completions`, {
     method: "POST",
     headers: createBearerJsonHeaders(apiKey),
     body: JSON.stringify({
-      max_tokens: 260,
-      messages: [
-        {
-          role: "system",
-          content: buildReplyInstructions(body.systemPrompt),
-        },
-        {
-          role: "user",
-          content: buildReplyInput(body),
-        },
-      ],
+      max_tokens: options.maxTokens ?? 260,
+      messages,
       model,
-      temperature: 0.3,
+      temperature: options.temperature ?? 0.3,
     }),
   });
   const payload = await readJsonResponse<ArkChatCompletionPayload>(upstream, extractArkError);
@@ -304,7 +349,7 @@ async function createVolcArkReply(body: AgentReplyPayload, env: AgentApiEnv): Pr
   return extractArkResponseText(payload);
 }
 
-async function createVolcSpeech(input: string, env: AgentApiEnv): Promise<Buffer> {
+export async function createVolcSpeech(input: string, env: AgentApiEnv): Promise<Buffer> {
   const apiKey = requireEnv(env.VOLC_TTS_API_KEY, "VOLC_TTS_API_KEY");
   const voiceType = requireEnv(env.VOLC_TTS_VOICE_TYPE, "VOLC_TTS_VOICE_TYPE");
   const upstream = await fetchWithTimeout(env.VOLC_TTS_URL || defaultVolcTtsUrl, {
@@ -362,15 +407,8 @@ function connectVolcAsrRelay(client: WebSocket, env: AgentApiEnv) {
   };
 
   try {
-    const apiKey = requireEnv(env.VOLC_ASR_API_KEY, "VOLC_ASR_API_KEY");
     const connectId = randomUUID();
-    upstream = new WebSocket(env.VOLC_ASR_STREAM_WS_URL || defaultVolcAsrStreamWsUrl, {
-      headers: {
-        "X-Api-Connect-Id": connectId,
-        "X-Api-Key": apiKey,
-        "X-Api-Resource-Id": env.VOLC_ASR_RESOURCE_ID || defaultVolcAsrResourceId,
-      },
-    });
+    upstream = createVolcAsrWebSocket(env, connectId);
 
     upstream.on("open", () => {
       console.info("[LawTriage ASR relay] upstream open", connectId);
@@ -571,7 +609,19 @@ function parseVolcTtsAudioChunks(responseText: string): Buffer[] {
   return chunks;
 }
 
-function createVolcAsrFullClientRequest(): Buffer {
+export function createVolcAsrWebSocket(env: AgentApiEnv, connectId = randomUUID()): WebSocket {
+  const apiKey = requireEnv(env.VOLC_ASR_API_KEY, "VOLC_ASR_API_KEY");
+
+  return new WebSocket(env.VOLC_ASR_STREAM_WS_URL || defaultVolcAsrStreamWsUrl, {
+    headers: {
+      "X-Api-Connect-Id": connectId,
+      "X-Api-Key": apiKey,
+      "X-Api-Resource-Id": env.VOLC_ASR_RESOURCE_ID || defaultVolcAsrResourceId,
+    },
+  });
+}
+
+export function createVolcAsrFullClientRequest(): Buffer {
   const payload = gzipSync(
     Buffer.from(
       JSON.stringify({
@@ -600,7 +650,7 @@ function createVolcAsrFullClientRequest(): Buffer {
   return createVolcAsrFrame([0x11, 0x10, 0x11, 0x00], payload);
 }
 
-function createVolcAsrAudioRequest(audio: Buffer, isLast: boolean): Buffer {
+export function createVolcAsrAudioRequest(audio: Buffer, isLast: boolean): Buffer {
   const payload = gzipSync(isLast ? Buffer.alloc(0) : audio);
 
   return createVolcAsrFrame([0x11, isLast ? 0x22 : 0x20, 0x11, 0x00], payload);
@@ -613,7 +663,7 @@ function createVolcAsrFrame(header: number[], payload: Buffer): Buffer {
   return Buffer.concat([Buffer.from(header), size, payload]);
 }
 
-function parseVolcAsrResponse(data: RawData): VolcAsrParsedResponse {
+export function parseVolcAsrResponse(data: RawData): VolcAsrParsedResponse {
   const buffer = rawDataToBuffer(data);
 
   if (buffer.byteLength < 8) {
@@ -993,7 +1043,7 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-type AgentReplyPayload = {
+export type AgentReplyPayload = {
   clientEvent?: {
     speaker: string;
     text: string;
@@ -1013,6 +1063,11 @@ type AgentReplyPayload = {
     text: string;
   }>;
   turnIndex?: number;
+};
+
+export type ArkChatMessage = {
+  content: string;
+  role: "assistant" | "system" | "user";
 };
 
 type ArkChatCompletionPayload = {
@@ -1055,7 +1110,7 @@ type VolcAsrClientMessage =
       type: "error";
     };
 
-type VolcAsrParsedResponse = {
+export type VolcAsrParsedResponse = {
   error?: string;
   text?: string;
   utterances: Array<{

@@ -21,6 +21,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   createDefaultAgentProviders,
   createInitialAgentState,
+  getAgentProviderMode,
 } from "./agentPipeline";
 import {
   appendTranscriptEvent,
@@ -54,6 +55,7 @@ import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } fr
 
 const defaultFixture = getDefaultDemoFixture();
 const initialIntake: IntakeForm = { ...defaultFixture.intake };
+const initialMediaConfig = createInitialMediaConfig();
 
 const agentProviders = createDefaultAgentProviders();
 
@@ -63,22 +65,43 @@ function logAgentFlow(message: string, data?: unknown) {
   }
 }
 
+function shouldUseLiveKitRoomAgent(config: MediaSessionConfig): boolean {
+  return config.mode === "livekit" && getAgentProviderMode() !== "dev";
+}
+
+function getAgentRuntimeProviderLabel(config: MediaSessionConfig): string {
+  return shouldUseLiveKitRoomAgent(config) ? "LiveKit Room Agent" : agentProviders.label;
+}
+
+function createIdleAgentStateForMediaConfig(config: MediaSessionConfig): AgentRuntimeState {
+  if (shouldUseLiveKitRoomAgent(config)) {
+    return {
+      providerLabel: getAgentRuntimeProviderLabel(config),
+      status: "idle",
+      detail: "LiveKit Agent worker 将在房间内处理 ASR / LLM / TTS。",
+    };
+  }
+
+  return createInitialAgentState(agentProviders);
+}
+
 function App() {
   const [selectedFixtureId, setSelectedFixtureId] = useState(defaultFixture.id);
   const [intake, setIntake] = useState<IntakeForm>(initialIntake);
   const [session, setSession] = useState<DemoSession | null>(null);
   const [agentState, setAgentState] = useState<AgentRuntimeState>(() =>
-    createInitialAgentState(agentProviders),
+    createIdleAgentStateForMediaConfig(initialMediaConfig),
   );
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [mediaConfig, setMediaConfig] = useState<MediaSessionConfig>(() => createInitialMediaConfig());
+  const [mediaConfig, setMediaConfig] = useState<MediaSessionConfig>(() => initialMediaConfig);
   const [mediaState, setMediaState] = useState<MediaConnectionState>(() =>
-    createInitialMediaState(createInitialMediaConfig()),
+    createInitialMediaState(initialMediaConfig),
   );
   const [mediaTransitionPending, setMediaTransitionPending] = useState(false);
   const agentTurnQueueRef = useRef<Promise<void>>(Promise.resolve());
   const mediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
+  const mediaConfigRef = useRef<MediaSessionConfig>(initialMediaConfig);
   const mediaTransitionPendingRef = useRef(false);
   const sessionRef = useRef<DemoSession | null>(null);
   const selectedFixture = useMemo(() => getDemoFixture(selectedFixtureId), [selectedFixtureId]);
@@ -114,6 +137,10 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    mediaConfigRef.current = mediaConfig;
+  }, [mediaConfig]);
+
   const dashboardDuration = useMemo(() => {
     if (!session) {
       return "00:00";
@@ -143,7 +170,7 @@ function App() {
     setIntake({ ...fixture.intake });
     commitSession(null);
     setElapsedSeconds(0);
-    setAgentState(createInitialAgentState(agentProviders));
+    setAgentState(createIdleAgentStateForMediaConfig(mediaConfigRef.current));
   }
 
   function updateMediaConfig(field: keyof MediaSessionConfig, value: string) {
@@ -158,6 +185,7 @@ function App() {
       };
 
       setMediaState(createInitialMediaState(next));
+      setAgentState(createIdleAgentStateForMediaConfig(next));
 
       return next;
     });
@@ -182,7 +210,7 @@ function App() {
       .then(() => processMediaTranscriptEvent(event))
       .catch((error) => {
         setAgentState({
-          providerLabel: agentProviders.label,
+          providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
           status: "failed",
           detail: "Agent 处理媒体文本事件失败。",
           error: getErrorMessage(error),
@@ -218,6 +246,19 @@ function App() {
       text: acceptedEvent.text,
       transcriptLength: sessionWithInput.transcript.length,
     });
+
+    if (shouldUseLiveKitRoomAgent(mediaConfigRef.current)) {
+      setAgentState({
+        providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
+        status: acceptedEvent.speaker === "client" ? "thinking" : "listening",
+        detail:
+          acceptedEvent.speaker === "client"
+            ? "LiveKit Agent 已收到客户语音，正在房间内生成回复。"
+            : "LiveKit Agent 回复已写回房间字幕流。",
+        lastReplyAt: acceptedEvent.speaker === "agent" ? new Date() : undefined,
+      });
+      return;
+    }
 
     if (acceptedEvent.speaker !== "client") {
       return;
@@ -326,6 +367,17 @@ function App() {
 
       mediaSessionRef.current = adapter;
       pendingMediaSessionRef.current = null;
+      if (shouldUseLiveKitRoomAgent(mediaConfigRef.current)) {
+        commitSession(nextSession);
+        setAgentState({
+          providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
+          status: "listening",
+          detail: "LiveKit Agent 已接管房间音频；等待远端语音、字幕和回复。",
+        });
+        setElapsedSeconds(0);
+        return;
+      }
+
       setAgentState({
         providerLabel: agentProviders.label,
         status: "thinking",
@@ -355,7 +407,7 @@ function App() {
         mediaSessionRef.current = null;
       }
       setAgentState({
-        providerLabel: agentProviders.label,
+        providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
         status: "failed",
         detail: "Agent 或 RTC 启动失败。",
         error: getErrorMessage(error),
@@ -412,7 +464,7 @@ function App() {
         detail: "RTC 媒体连接已断开，转写和结构化结果已保留。",
       });
       setAgentState({
-        providerLabel: agentProviders.label,
+        providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
         status: "idle",
         detail: "演示会话已结束。",
       });
@@ -536,16 +588,7 @@ function App() {
                     placeholder="wss://your-project.livekit.cloud"
                   />
                 </Field>
-                <Field label="Participant Token">
-                  <input
-                    aria-label="Participant Token"
-                    disabled={mediaConfigLocked}
-                    value={mediaConfig.liveKitToken}
-                    onChange={(event) => updateMediaConfig("liveKitToken", event.target.value)}
-                    placeholder="由 token service 签发的短期 token"
-                    type="password"
-                  />
-                </Field>
+                <p className="rtc-detail">Participant token 会在开始咨询时由本地后端短期签发。</p>
               </>
             ) : null}
             <div className="rtc-status-row">
