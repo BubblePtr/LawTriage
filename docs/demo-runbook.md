@@ -11,6 +11,8 @@
 - 默认使用 `Dev Mock` 媒体模式，不需要外部 RTC 凭证。
 - 如需验证 LiveKit，先按 `docs/rtc.md` 写入 `.env.local`，再重启 Vite。
 - 如需验证真实 ASR/LLM/TTS，设置 `VITE_AGENT_PROVIDER=volcengine` 并按 `docs/rtc.md` 填入火山服务端环境变量，再重启 Vite。
+- 如需先独立验证本地火山级联链路，运行 `bun run agent:validate-volcengine`。
+- 如需验证真正的 LiveKit Agent 房间流程，确认 `LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET` 已配置，再另开终端启动 `bun run agent:dev`。
 - 准备浏览器麦克风授权；`本机麦克风` 和 `LiveKit` 模式下需要允许麦克风。
 
 ## 预设用例
@@ -42,24 +44,31 @@
 
 ## LiveKit 验证路径
 
-1. 生成短期 participant token，写入 `.env.local`。
-2. 重启 `bun run dev`。
-3. 左侧媒体模式选择 `LiveKit`。
-4. 点击“开始咨询”，浏览器允许麦克风。
-5. 确认 RTC 状态进入“已连接”，并在失败时检查 UI 展示的明确错误。
+1. 确认 `.env.local` 有 `VITE_LIVEKIT_URL`、`LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET`；浏览器 participant token 会由本地后端短期签发。
+2. 先运行 `bun run agent:validate-volcengine`，确认本地火山 `TTS -> ASR -> Ark -> TTS` 级联可用。
+3. 如需真实 Agent，确认 `.env.local` 有 `LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET`、`AGENT_PROVIDER=volcengine` 和火山 `ARK_*` / `VOLC_*` 配置。
+4. 启动 `bun run agent:dev`。
+5. 重启 `bun run dev`。
+6. 左侧媒体模式选择 `LiveKit`。
+7. 点击“开始咨询”，浏览器允许麦克风。
+8. 确认 RTC 状态进入“已连接”，并在失败时检查 UI 展示的明确错误。
+9. 启用真实 Agent provider 时，实时转写应来自 LiveKit room 的 transcription 事件，Agent 回复应以远端 Agent 音轨播放。
 
-## 真实级联 Provider 验证路径
+`VITE_AGENT_PROVIDER=dev` 时，LiveKit 模式仍可用于验证浏览器入房和麦克风发布，但对话事件走内置演示文本流。
+
+## 本机真实级联 Provider 验证路径
 
 1. 按 `docs/rtc.md` 配置 `VITE_AGENT_PROVIDER=volcengine`、火山方舟、豆包 ASR 和豆包 TTS 环境变量。
 2. 重启 `bun run dev`。
-3. 媒体模式选择 `本机麦克风`，点击“开始咨询”后允许浏览器麦克风。
-4. 先用 `/api/agent/reply` 和 `/api/agent/speech` 验证火山方舟回复和豆包 TTS 播报。
-5. ASR 会通过本地 `/api/agent/asr` WebSocket relay 接入火山大模型流式语音识别；不要用录音文件极速版替代实时链路。
-6. 点击“结束通话”，检查右侧结构化档案仍按 transcript/result 链路生成。
+3. 左侧媒体模式选择 `本机麦克风`。
+4. 点击“开始咨询”，浏览器允许麦克风。
+5. 先用 `/api/agent/reply` 和 `/api/agent/speech` 验证火山方舟回复和豆包 TTS 播报。
+6. ASR 会通过本地 `/api/agent/asr` WebSocket relay 接入火山大模型流式语音识别；不要用录音文件极速版替代实时链路。
+7. 点击“结束通话”，检查右侧结构化档案仍按 transcript/result 链路生成。需要验证 RTC 房间时，改走上面的 LiveKit Agent worker 路径。
 
 ## 失败 Fallback
 
-- LiveKit token 过期或 URL 不正确：切回 `Dev Mock`，继续完成演示主路径。
+- LiveKit token 签发失败或 URL 不正确：确认 `LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET` 后重启 dev server；必要时切回 `Dev Mock`，继续完成演示主路径。
 - 火山 API key、音色或资源 ID 未开通：切回 `VITE_AGENT_PROVIDER=dev` 并重启 dev server，继续使用稳定演示链路。新版控制台只需要 API Key，不需要旧版 App Key / Access Key。
 - 浏览器麦克风授权失败：刷新页面后重新授权；仍失败时切回 `Dev Mock` 验证稳定演示主路径。
 - Agent 对话未继续追加：结束当前通话，重新选择用例并开始新 session。
@@ -69,6 +78,6 @@
 ## 演示后清理
 
 - 停止本地 dev server。
-- 不提交 `.env.local` 或任何真实 LiveKit token。
+- 不提交 `.env.local` 或任何真实 LiveKit API secret。
 - 如为现场演示临时改过 `src/demoFixtures.ts`，演示后恢复为稳定用例。
-- 如使用真实 LiveKit room，确认临时 token 已过期或撤销。
+- 如使用真实 LiveKit room，结束会话后确认 worker 和 dev server 已停止。

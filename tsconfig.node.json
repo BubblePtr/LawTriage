@@ -16,5 +16,5 @@
     "noUncheckedSideEffectImports": true,
     "skipLibCheck": true
   },
-  "include": ["vite.config.ts", "server/**/*.ts"]
+  "include": ["agent/**/*.ts", "vite.config.ts", "server/**/*.ts"]
 }

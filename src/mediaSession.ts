@@ -1,5 +1,6 @@
 import { createMockClientTranscriptEvent, getMockClientTranscriptLength } from "./demoSession";
-import { getAgentProviderMode } from "./agentPipeline";
+import { getAgentProviderMode, type AgentProviderKind } from "./agentPipeline";
+import { lawTriageAgentReplyTopic } from "./livekitTopics";
 import type { DemoSession, TranscriptEvent } from "./types";
 
 export type MediaSessionMode = "mock" | "browser" | "livekit";
@@ -37,6 +38,43 @@ export type MediaSessionAdapter = {
 
 type LiveKitRoom = import("livekit-client").Room;
 type LiveKitRoomEvent = typeof import("livekit-client").RoomEvent;
+type LiveKitLocalAudioTrack = import("livekit-client").LocalAudioTrack;
+type LiveKitLocalTrackPublication = import("livekit-client").LocalTrackPublication;
+type LiveKitParticipant = import("livekit-client").Participant;
+type LiveKitRemoteTrack = import("livekit-client").RemoteTrack;
+type LiveKitRemoteTrackPublication = import("livekit-client").RemoteTrackPublication;
+type LiveKitTrackPublication = import("livekit-client").TrackPublication;
+type LiveKitTranscriptionSegment = import("livekit-client").TranscriptionSegment;
+type LiveKitTrackPublishOptions = import("livekit-client").TrackPublishOptions;
+type LiveKitTextStreamReader = AsyncIterable<string> & {
+  info: {
+    attributes?: Record<string, string>;
+    id: string;
+    timestamp: number;
+  };
+  readAll: () => Promise<string>;
+};
+
+type LiveKitAgentReplyStreamPayload = {
+  id: string;
+  text: string;
+  timestamp: number;
+};
+
+type LiveKitMicActivityMonitor = {
+  analyser: AnalyserNode;
+  audioContext: AudioContext;
+  intervalId: number;
+  source: MediaStreamAudioSourceNode;
+};
+
+type LiveKitTokenResponse = {
+  expiresAt: string;
+  identity: string;
+  roomName: string;
+  token: string;
+  url: string;
+};
 
 type AsrSocketMessage =
   | {
@@ -54,10 +92,12 @@ type AsrSocketMessage =
     };
 
 export function createInitialMediaConfig(): MediaSessionConfig {
+  const liveKitUrl = import.meta.env.VITE_LIVEKIT_URL ?? "";
+
   return {
-    mode: getAgentProviderMode() !== "dev" ? "browser" : hasLiveKitDefaults() ? "livekit" : "mock",
-    liveKitUrl: import.meta.env.VITE_LIVEKIT_URL ?? "",
-    liveKitToken: import.meta.env.VITE_LIVEKIT_TOKEN ?? "",
+    mode: resolveInitialMediaMode(getAgentProviderMode(), liveKitUrl),
+    liveKitUrl,
+    liveKitToken: "",
   };
 }
 
@@ -73,10 +113,10 @@ export function createInitialMediaState(config: MediaSessionConfig): MediaConnec
   return {
     mode: config.mode,
     status: "idle",
-    detail:
-      config.mode === "mock"
-        ? "Dev Mock 可用，无需 RTC 凭证。"
-        : "等待 LiveKit participant token。",
+      detail:
+        config.mode === "mock"
+          ? "Dev Mock 可用，无需 RTC 凭证。"
+        : "LiveKit token 将在开始咨询时由本地后端短期签发。",
   };
 }
 
@@ -104,22 +144,55 @@ export function validateMediaSessionConfig(config: MediaSessionConfig): string |
   }
 
   if (config.mode === "livekit") {
-    if (!config.liveKitUrl.trim()) {
-      return "缺少 LiveKit URL。";
-    }
-
-    if (!config.liveKitToken.trim()) {
-      return "缺少 LiveKit participant token。";
-    }
-
     return undefined;
   }
 
   return undefined;
 }
 
-function hasLiveKitDefaults(): boolean {
-  return Boolean(import.meta.env.VITE_LIVEKIT_URL && import.meta.env.VITE_LIVEKIT_TOKEN);
+function resolveInitialMediaMode(agentProviderMode: AgentProviderKind, liveKitUrl: string): MediaSessionMode {
+  if (liveKitUrl.trim()) {
+    return "livekit";
+  }
+
+  return agentProviderMode === "dev" ? "mock" : "browser";
+}
+
+function getRealtimeAudioCaptureOptions() {
+  return {
+    autoGainControl: true,
+    echoCancellation: true,
+    noiseSuppression: true,
+  };
+}
+
+function getLiveKitMicPublishOptions(): LiveKitTrackPublishOptions {
+  return {
+    dtx: false,
+    red: false,
+  };
+}
+
+function createLiveKitAudioPlaybackState(playing: boolean, error?: unknown): MediaConnectionState {
+  if (playing) {
+    return {
+      mode: "livekit",
+      status: "connected",
+      detail: "LiveKit Agent 远端音频播放已恢复。",
+    };
+  }
+
+  const state: MediaConnectionState = {
+    mode: "livekit",
+    status: "failed",
+    detail: "浏览器阻止了 LiveKit Agent 远端音频播放。",
+  };
+
+  if (error !== undefined) {
+    state.error = getErrorMessage(error);
+  }
+
+  return state;
 }
 
 class MockMediaSessionAdapter implements MediaSessionAdapter {
@@ -216,8 +289,17 @@ class BrowserMicMediaSessionAdapter implements MediaSessionAdapter {
 }
 
 class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
-  private audioTranscription?: BrowserAudioTranscriptionSession;
   private handlers?: MediaSessionHandlers;
+  private localMicActivityMonitor?: LiveKitMicActivityMonitor;
+  private receivedAgentReplyIds = new Set<string>();
+  private receivedTranscriptionSegmentIds = new Set<string>();
+  private remoteAudioElements = new Map<
+    string,
+    {
+      element: HTMLMediaElement;
+      track: LiveKitRemoteTrack;
+    }
+  >();
   private room?: LiveKitRoom;
   private transcriptTimers: number[] = [];
 
@@ -242,28 +324,32 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       this.handlers = handlers;
       this.bindRoomLifecycle(room, handlers, RoomEvent);
 
-      await room.connect(this.config.liveKitUrl.trim(), this.config.liveKitToken.trim());
-      await room.localParticipant.setMicrophoneEnabled(true);
+      const credentials = await resolveLiveKitCredentials(this.config, session);
+      await room.connect(credentials.url, credentials.token);
+      const microphonePublication = await room.localParticipant.setMicrophoneEnabled(
+        true,
+        getRealtimeAudioCaptureOptions(),
+        getLiveKitMicPublishOptions(),
+      );
+      this.startLocalMicActivityMonitor(microphonePublication);
 
       handlers.onStateChange({
         mode: "livekit",
         status: "connected",
         detail:
-          shouldUseBrowserAudioTranscription()
-            ? `LiveKit 已连接，麦克风音轨已发布，${getAsrProviderLabel()} 正在监听。`
-            : "LiveKit 已连接，麦克风音轨已发布，演示文本事件流已启动。",
+          getAgentProviderMode() === "dev"
+            ? "LiveKit 已连接，麦克风音轨已发布，演示文本事件流已启动。"
+            : `LiveKit 已连接：${credentials.roomName}；等待 LiveKit Agent 入房并发布语音和转写。`,
       });
 
-      if (shouldUseBrowserAudioTranscription()) {
-        this.audioTranscription = new BrowserAudioTranscriptionSession("livekit");
-        await this.audioTranscription.start(handlers);
-        return;
+      if (getAgentProviderMode() === "dev") {
+        this.transcriptTimers = scheduleDemoTranscriptEvents(session, handlers);
       }
-
-      this.transcriptTimers = scheduleDemoTranscriptEvents(session, handlers);
     } catch (error) {
-      this.audioTranscription?.stop();
-      this.audioTranscription = undefined;
+      this.clearRemoteAudio();
+      this.stopLocalMicActivityMonitor();
+      this.receivedAgentReplyIds.clear();
+      this.receivedTranscriptionSegmentIds.clear();
       clearTranscriptTimers(this.transcriptTimers);
       this.transcriptTimers = [];
       if (room) {
@@ -294,8 +380,10 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
 
     clearTranscriptTimers(this.transcriptTimers);
     this.transcriptTimers = [];
-    this.audioTranscription?.stop();
-    this.audioTranscription = undefined;
+    this.clearRemoteAudio();
+    this.stopLocalMicActivityMonitor();
+    this.receivedAgentReplyIds.clear();
+    this.receivedTranscriptionSegmentIds.clear();
     activeHandlers?.onStateChange({
       mode: "livekit",
       status: "disconnecting",
@@ -359,13 +447,76 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       this.handlers = undefined;
       clearTranscriptTimers(this.transcriptTimers);
       this.transcriptTimers = [];
-      this.audioTranscription?.stop();
-      this.audioTranscription = undefined;
+      this.clearRemoteAudio();
+      this.stopLocalMicActivityMonitor();
+      this.receivedAgentReplyIds.clear();
+      this.receivedTranscriptionSegmentIds.clear();
       handlers.onStateChange({
         mode: "livekit",
         status: "disconnected",
         detail: getLiveKitDisconnectDetail(reason),
       });
+    });
+
+    room.on(RoomEvent.ParticipantConnected, (participant) => {
+      if (!participant.isAgent) {
+        return;
+      }
+
+      emitIfCurrent({
+        mode: "livekit",
+        status: "connected",
+        detail: `LiveKit Agent 已加入房间：${participant.identity}。`,
+      });
+    });
+
+    room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+      if (!participant.isAgent) {
+        return;
+      }
+
+      emitIfCurrent({
+        mode: "livekit",
+        status: "connected",
+        detail: `LiveKit Agent 已离开房间：${participant.identity}。`,
+      });
+    });
+
+    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (this.room !== room) {
+        return;
+      }
+
+      this.attachRemoteAudio(room, track, publication, participant.identity);
+    });
+
+    room.on(RoomEvent.TrackUnsubscribed, (track, publication) => {
+      this.detachRemoteAudio(track, publication);
+    });
+
+    room.on(RoomEvent.TranscriptionReceived, (segments, participant, publication) => {
+      if (this.room !== room) {
+        return;
+      }
+
+      this.emitLiveKitTranscripts(room, segments, participant, publication);
+    });
+
+    room.registerTextStreamHandler("lk.transcription", (reader, participantInfo) => {
+      void this.handleLiveKitTranscriptionTextStream(
+        room,
+        reader as LiveKitTextStreamReader,
+        participantInfo.identity,
+      );
+    });
+
+    room.registerTextStreamHandler(lawTriageAgentReplyTopic, (reader) => {
+      void this.handleLiveKitAgentReplyTextStream(reader as LiveKitTextStreamReader);
+    });
+
+    room.on(RoomEvent.AudioPlaybackStatusChanged, (playing) => {
+      console.info("[LawTriage LiveKit audio] playback status changed", { playing });
+      emitIfCurrent(createLiveKitAudioPlaybackState(playing));
     });
 
     room.on(RoomEvent.MediaDevicesError, (error) => {
@@ -376,6 +527,309 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
         error: getErrorMessage(error),
       });
     });
+  }
+
+  private attachRemoteAudio(
+    room: LiveKitRoom,
+    track: LiveKitRemoteTrack,
+    publication: LiveKitRemoteTrackPublication,
+    participantIdentity: string,
+  ) {
+    if (track.kind !== "audio") {
+      return;
+    }
+
+    const trackKey = getRemoteTrackKey(track, publication, participantIdentity);
+    console.info("[LawTriage LiveKit audio] remote audio track subscribed", {
+      participantIdentity,
+      source: publication.source,
+      trackKey,
+      trackName: publication.trackName,
+    });
+
+    if (this.remoteAudioElements.has(trackKey)) {
+      return;
+    }
+
+    const element = track.attach() as HTMLAudioElement;
+    element.autoplay = true;
+    element.dataset.livekitTrackId = trackKey;
+    element.style.display = "none";
+    document.body.appendChild(element);
+    this.remoteAudioElements.set(trackKey, { element, track });
+    void this.resumeRemoteAudioPlayback(room, element);
+  }
+
+  private async resumeRemoteAudioPlayback(room: LiveKitRoom, element: HTMLMediaElement) {
+    try {
+      await element.play();
+      await room.startAudio();
+      console.info("[LawTriage LiveKit audio] remote audio playback started", {
+        muted: element.muted,
+        paused: element.paused,
+        readyState: element.readyState,
+        volume: element.volume,
+      });
+    } catch (error) {
+      if (this.room !== room) {
+        return;
+      }
+
+      this.handlers?.onStateChange(createLiveKitAudioPlaybackState(false, error));
+    }
+  }
+
+  private detachRemoteAudio(track: LiveKitRemoteTrack, publication: LiveKitRemoteTrackPublication) {
+    const trackKey = getRemoteTrackKey(track, publication);
+    const entry = this.remoteAudioElements.get(trackKey);
+
+    if (entry) {
+      entry.track.detach(entry.element);
+      entry.element.remove();
+      this.remoteAudioElements.delete(trackKey);
+      return;
+    }
+
+    for (const detachedElement of track.detach()) {
+      detachedElement.remove();
+    }
+  }
+
+  private clearRemoteAudio() {
+    for (const { element, track } of this.remoteAudioElements.values()) {
+      track.detach(element);
+      element.remove();
+    }
+
+    this.remoteAudioElements.clear();
+  }
+
+  private startLocalMicActivityMonitor(publication?: LiveKitLocalTrackPublication) {
+    this.stopLocalMicActivityMonitor();
+
+    const track = publication?.track;
+
+    if (!track || track.kind !== "audio") {
+      console.warn("[LawTriage LiveKit mic] microphone publication missing or not audio", {
+        hasPublication: Boolean(publication),
+      });
+      return;
+    }
+
+    const mediaStreamTrack = (track as LiveKitLocalAudioTrack).mediaStreamTrack;
+    const audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    const samples = new Uint8Array(analyser.fftSize);
+    let detected = false;
+    let sampleCount = 0;
+
+    source.connect(analyser);
+    void audioContext.resume().catch((error) => {
+      console.warn("[LawTriage LiveKit mic] microphone activity monitor could not resume", getErrorMessage(error));
+    });
+
+    const intervalId = window.setInterval(() => {
+      analyser.getByteTimeDomainData(samples);
+      sampleCount += 1;
+
+      if (!detected && isLiveKitMicAudioActive(samples)) {
+        detected = true;
+        console.info("[LawTriage LiveKit mic] local microphone audio detected", {
+          readyState: mediaStreamTrack.readyState,
+          trackEnabled: mediaStreamTrack.enabled,
+          trackMuted: mediaStreamTrack.muted,
+        });
+        return;
+      }
+
+      if (!detected && sampleCount === 30) {
+        console.warn("[LawTriage LiveKit mic] no local microphone audio detected after sampling", {
+          readyState: mediaStreamTrack.readyState,
+          trackEnabled: mediaStreamTrack.enabled,
+          trackMuted: mediaStreamTrack.muted,
+        });
+      }
+    }, 500);
+
+    this.localMicActivityMonitor = {
+      analyser,
+      audioContext,
+      intervalId,
+      source,
+    };
+  }
+
+  private stopLocalMicActivityMonitor() {
+    const monitor = this.localMicActivityMonitor;
+
+    if (!monitor) {
+      return;
+    }
+
+    window.clearInterval(monitor.intervalId);
+    monitor.source.disconnect();
+    monitor.analyser.disconnect();
+    void monitor.audioContext.close().catch(() => undefined);
+    this.localMicActivityMonitor = undefined;
+  }
+
+  private emitLiveKitTranscripts(
+    room: LiveKitRoom,
+    segments: LiveKitTranscriptionSegment[],
+    participant?: LiveKitParticipant,
+    publication?: LiveKitTrackPublication,
+  ) {
+    const speaker = getLiveKitTranscriptSpeaker(room, participant, publication);
+
+    if (!shouldAcceptLiveKitTranscriptionSpeaker(speaker)) {
+      return;
+    }
+
+    for (const segment of segments) {
+      const text = normalizeTranscriptText(segment.text);
+
+      if (!segment.final || !text || this.receivedTranscriptionSegmentIds.has(segment.id)) {
+        continue;
+      }
+
+      this.receivedTranscriptionSegmentIds.add(segment.id);
+      this.handlers?.onTranscriptEvent?.({
+        id: `lk-${segment.id}`,
+        speaker,
+        text,
+        timestamp: new Date(segment.lastReceivedTime),
+      });
+    }
+  }
+
+  private async handleLiveKitTranscriptionTextStream(
+    room: LiveKitRoom,
+    reader: LiveKitTextStreamReader,
+    senderIdentity: string,
+  ) {
+    const attributes = reader.info.attributes ?? {};
+    const segmentId = attributes["lk.segment_id"] || reader.info.id;
+    const trackId = attributes["lk.transcribed_track_id"];
+    const speaker = getLiveKitTextStreamSpeaker(room, senderIdentity, trackId);
+
+    if (!shouldAcceptLiveKitTranscriptionTextStream(speaker)) {
+      await drainLiveKitTextStream(reader);
+      return;
+    }
+
+    try {
+      const text = parseLiveKitTranscriptionStreamText(await reader.readAll());
+
+      if (!text || !shouldEmitLiveKitTextStreamSegment(this.receivedTranscriptionSegmentIds, segmentId)) {
+        return;
+      }
+
+      console.info("[LawTriage LiveKit transcript] text stream received", {
+        final: attributes["lk.transcription_final"],
+        segmentId,
+        speaker,
+        textLength: text.length,
+      });
+      this.handlers?.onTranscriptEvent?.({
+        id: `lk-stream-${segmentId}`,
+        speaker,
+        text,
+        timestamp: new Date(reader.info.timestamp || Date.now()),
+      });
+    } catch (error) {
+      console.warn("[LawTriage LiveKit transcript] text stream failed", getErrorMessage(error));
+    }
+  }
+
+  private async handleLiveKitAgentReplyTextStream(reader: LiveKitTextStreamReader) {
+    try {
+      const payload = parseLiveKitAgentReplyStreamText(await reader.readAll());
+
+      if (!payload || !shouldEmitLiveKitAgentReply(this.receivedAgentReplyIds, payload.id)) {
+        return;
+      }
+
+      console.info("[LawTriage LiveKit transcript] agent reply stream received", {
+        id: payload.id,
+        textLength: payload.text.length,
+      });
+      this.handlers?.onTranscriptEvent?.(createLiveKitAgentReplyTranscriptEvent(payload));
+    } catch (error) {
+      console.warn("[LawTriage LiveKit transcript] agent reply stream failed", getErrorMessage(error));
+    }
+  }
+
+}
+
+async function resolveLiveKitCredentials(
+  config: MediaSessionConfig,
+  session: DemoSession,
+): Promise<LiveKitTokenResponse> {
+  const manualToken = config.liveKitToken.trim();
+  const manualUrl = config.liveKitUrl.trim();
+
+  if (manualToken && manualUrl) {
+    return {
+      expiresAt: "",
+      identity: "manual-browser",
+      roomName: session.id,
+      token: manualToken,
+      url: manualUrl,
+    };
+  }
+
+  const response = await fetch("/api/livekit/token", {
+    body: JSON.stringify({
+      identity: createLiveKitBrowserIdentity(session),
+      name: "Demo Browser",
+      roomName: createLiveKitRoomName(session),
+    }),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response, "LiveKit token 签发失败。"));
+  }
+
+  const payload = (await response.json()) as Partial<LiveKitTokenResponse>;
+  const token = payload.token?.trim();
+  const url = manualUrl || payload.url?.trim();
+  const roomName = payload.roomName?.trim();
+  const identity = payload.identity?.trim();
+
+  if (!token || !url || !roomName || !identity) {
+    throw new Error("LiveKit token service 返回内容不完整。");
+  }
+
+  return {
+    expiresAt: payload.expiresAt ?? "",
+    identity,
+    roomName,
+    token,
+    url,
+  };
+}
+
+function createLiveKitRoomName(session: DemoSession): string {
+  return `lawtriage-${session.id.toLowerCase()}`;
+}
+
+function createLiveKitBrowserIdentity(session: DemoSession): string {
+  return `browser-${session.id.toLowerCase()}`;
+}
+
+async function readApiError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = (await response.json()) as { error?: string };
+
+    return payload.error || fallback;
+  } catch {
+    return fallback;
   }
 }
 
@@ -413,14 +867,17 @@ class BrowserAudioTranscriptionSession {
   private stopped = true;
   private ttsActive = false;
 
-  constructor(private readonly mode: MediaSessionMode) {}
+  constructor(
+    private readonly mode: MediaSessionMode,
+    private readonly inputStream?: MediaStream,
+  ) {}
 
   async start(handlers: MediaSessionHandlers): Promise<void> {
     if (!handlers.onTranscriptEvent) {
       return;
     }
 
-    if (!navigator.mediaDevices?.getUserMedia) {
+    if (!this.inputStream && !navigator.mediaDevices?.getUserMedia) {
       throw new Error("当前浏览器不支持麦克风录音。");
     }
 
@@ -438,13 +895,7 @@ class BrowserAudioTranscriptionSession {
       throw new Error("当前浏览器不支持 MediaRecorder。");
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
+    const stream = await this.openAudioInputStream();
     const mimeType = selectAudioMimeType();
     const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
 
@@ -496,13 +947,7 @@ class BrowserAudioTranscriptionSession {
       throw new Error("当前浏览器不支持 Web Audio。");
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        autoGainControl: true,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
+    const stream = await this.openAudioInputStream();
     const audioContext = new AudioContextCtor();
     const audioSource = audioContext.createMediaStreamSource(stream);
     const audioNode = audioContext.createScriptProcessor(4096, 1, 1);
@@ -549,6 +994,20 @@ class BrowserAudioTranscriptionSession {
     audioSource.connect(audioNode);
     audioNode.connect(audioContext.destination);
     await audioContext.resume();
+  }
+
+  private async openAudioInputStream(): Promise<MediaStream> {
+    const stream =
+      this.inputStream ??
+      (await navigator.mediaDevices.getUserMedia({
+        audio: getRealtimeAudioCaptureOptions(),
+      }));
+
+    if (stream.getAudioTracks().length === 0) {
+      throw new Error(`${getMediaInputLabel(this.mode)}没有可用音频轨道。`);
+    }
+
+    return stream;
   }
 
   private ensureAsrSocket(handlers: MediaSessionHandlers): WebSocket | undefined {
@@ -634,7 +1093,7 @@ class BrowserAudioTranscriptionSession {
               handlers.onStateChange({
                 mode: this.mode,
                 status: "connected",
-                detail: `本机麦克风已接通，${getAsrProviderLabel()} 等待客户说话。`,
+                detail: `${getMediaInputLabel(this.mode)}已接入，${getAsrProviderLabel()} 等待客户说话。`,
               });
             }
           };
@@ -1071,8 +1530,12 @@ function normalizeTranscriptText(text: string | undefined): string {
   return (text ?? "").replace(/\s+/g, " ").trim();
 }
 
-function shouldUseBrowserAudioTranscription(): boolean {
-  return getAgentProviderMode() !== "dev";
+function getMediaInputLabel(mode: MediaSessionMode): string {
+  if (mode === "livekit") {
+    return "LiveKit 麦克风音轨";
+  }
+
+  return "本机麦克风";
 }
 
 function getAsrProviderLabel(): string {
@@ -1087,6 +1550,202 @@ function getAsrProviderLabel(): string {
   }
 
   return "Dev ASR";
+}
+
+function getRemoteTrackKey(
+  track: LiveKitRemoteTrack,
+  publication: LiveKitRemoteTrackPublication,
+  participantIdentity = "remote",
+): string {
+  return publication.trackSid || track.sid || `${participantIdentity}:${publication.trackName}`;
+}
+
+function getLiveKitTranscriptSpeaker(
+  room: LiveKitRoom,
+  participant?: LiveKitParticipant,
+  publication?: LiveKitTrackPublication,
+): TranscriptEvent["speaker"] {
+  if (participant?.identity === room.localParticipant.identity) {
+    return "client";
+  }
+
+  if (publication && isLocalTrackPublication(room, publication)) {
+    return "client";
+  }
+
+  return "agent";
+}
+
+function getLiveKitTextStreamSpeaker(
+  room: LiveKitRoom,
+  senderIdentity: string,
+  trackId?: string,
+): TranscriptEvent["speaker"] {
+  if (senderIdentity === room.localParticipant.identity) {
+    return "client";
+  }
+
+  if (trackId && isLocalTrackId(room, trackId)) {
+    return "client";
+  }
+
+  return "agent";
+}
+
+function isLocalTrackPublication(room: LiveKitRoom, publication: LiveKitTrackPublication): boolean {
+  const trackSid = publication.trackSid;
+
+  return !!trackSid && isLocalTrackId(room, trackSid);
+}
+
+function isLocalTrackId(room: LiveKitRoom, trackId: string): boolean {
+  for (const localPublication of room.localParticipant.trackPublications.values()) {
+    if (localPublication.trackSid === trackId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function parseLiveKitTranscriptionStreamText(payload: string): string {
+  const normalizedPayload = payload.trim();
+
+  if (!normalizedPayload) {
+    return "";
+  }
+
+  const lines = normalizedPayload.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const jsonTexts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as { text?: unknown };
+
+      if (typeof parsed.text !== "string") {
+        return normalizeTranscriptText(payload);
+      }
+
+      jsonTexts.push(parsed.text);
+    } catch {
+      return normalizeTranscriptText(payload);
+    }
+  }
+
+  return normalizeTranscriptText(jsonTexts.join(""));
+}
+
+function shouldEmitLiveKitTextStreamSegment(seenSegmentIds: Set<string>, segmentId: string): boolean {
+  if (seenSegmentIds.has(segmentId)) {
+    return false;
+  }
+
+  seenSegmentIds.add(segmentId);
+  return true;
+}
+
+function shouldAcceptLiveKitTranscriptionSpeaker(speaker: TranscriptEvent["speaker"]): boolean {
+  return speaker === "client";
+}
+
+function shouldAcceptLiveKitTranscriptionTextStream(_speaker: TranscriptEvent["speaker"]): boolean {
+  return false;
+}
+
+async function drainLiveKitTextStream(reader: LiveKitTextStreamReader): Promise<void> {
+  try {
+    await reader.readAll();
+  } catch {
+    return;
+  }
+}
+
+function isLiveKitMicAudioActive(samples: Uint8Array): boolean {
+  let peak = 0;
+  let total = 0;
+
+  for (const sample of samples) {
+    const deviation = Math.abs(sample - 128);
+    peak = Math.max(peak, deviation);
+    total += deviation;
+  }
+
+  return peak >= 20 && total / samples.length >= 4;
+}
+
+function parseLiveKitAgentReplyStreamText(payload: string): LiveKitAgentReplyStreamPayload | undefined {
+  const normalizedPayload = payload.trim();
+
+  if (!normalizedPayload) {
+    return undefined;
+  }
+
+  const parsed = JSON.parse(normalizedPayload) as {
+    id?: unknown;
+    role?: unknown;
+    text?: unknown;
+    timestamp?: unknown;
+  };
+
+  if (parsed.role !== "assistant" || typeof parsed.id !== "string" || typeof parsed.text !== "string") {
+    return undefined;
+  }
+
+  const text = normalizeTranscriptText(parsed.text);
+
+  if (!text) {
+    return undefined;
+  }
+
+  return {
+    id: parsed.id,
+    text,
+    timestamp: typeof parsed.timestamp === "number" && Number.isFinite(parsed.timestamp) ? parsed.timestamp : Date.now(),
+  };
+}
+
+function shouldEmitLiveKitAgentReply(seenReplyIds: Set<string>, replyId: string): boolean {
+  if (seenReplyIds.has(replyId)) {
+    return false;
+  }
+
+  seenReplyIds.add(replyId);
+  return true;
+}
+
+function createLiveKitAgentReplyTranscriptEvent(
+  payload: LiveKitAgentReplyStreamPayload,
+  receivedAt = new Date(),
+): TranscriptEvent {
+  return {
+    id: `lk-agent-${payload.id}`,
+    speaker: "agent",
+    text: payload.text,
+    timestamp: receivedAt,
+  };
+}
+
+export const createLiveKitAgentReplyTranscriptEventForTest = createLiveKitAgentReplyTranscriptEvent;
+export const parseLiveKitAgentReplyStreamTextForTest = parseLiveKitAgentReplyStreamText;
+export const parseLiveKitTranscriptionStreamTextForTest = parseLiveKitTranscriptionStreamText;
+export const resolveInitialMediaModeForTest = resolveInitialMediaMode;
+export const createLiveKitAudioPlaybackStateForTest = createLiveKitAudioPlaybackState;
+export const getLiveKitMicPublishOptionsForTest = getLiveKitMicPublishOptions;
+export const isLiveKitMicAudioActiveForTest = isLiveKitMicAudioActive;
+export const shouldAcceptLiveKitTranscriptionSpeakerForTest = shouldAcceptLiveKitTranscriptionSpeaker;
+export const shouldAcceptLiveKitTranscriptionTextStreamForTest = shouldAcceptLiveKitTranscriptionTextStream;
+export const shouldEmitLiveKitAgentReplyForTest = shouldEmitLiveKitAgentReply;
+export const shouldEmitLiveKitTextStreamSegmentForTest = shouldEmitLiveKitTextStreamSegment;
+export function getLiveKitTextStreamSpeakerForTest(
+  senderIdentity: string,
+  localIdentity: string,
+  localTrackMatched = false,
+): TranscriptEvent["speaker"] {
+  if (senderIdentity === localIdentity || localTrackMatched) {
+    return "client";
+  }
+
+  return "agent";
 }
 
 async function readAgentApiError(response: Response, fallback: string): Promise<string> {

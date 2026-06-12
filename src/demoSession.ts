@@ -32,6 +32,7 @@ const transcriptTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 });
 
+const duplicateTranscriptWindowMs = 2_500;
 const defaultScenario = createDemoScenarioSnapshot(getDefaultDemoFixture());
 
 export function getMockClientTranscriptLength(session: DemoSession): number {
@@ -103,6 +104,10 @@ export function endDemoSession(session: DemoSession): DemoSession {
 }
 
 export function appendTranscriptEvent(session: DemoSession, event: TranscriptEvent): DemoSession {
+  if (hasNearDuplicateTranscriptEvent(session.transcript, event)) {
+    return session;
+  }
+
   const transcript = [...session.transcript, event].sort(
     (left, right) => left.timestamp.getTime() - right.timestamp.getTime(),
   );
@@ -112,6 +117,23 @@ export function appendTranscriptEvent(session: DemoSession, event: TranscriptEve
     transcript,
     triageSlots: createTriageSlotSnapshot(session.intake, transcript),
   };
+}
+
+function hasNearDuplicateTranscriptEvent(transcript: TranscriptEvent[], event: TranscriptEvent): boolean {
+  const normalizedText = normalizeTranscriptText(event.text);
+  const timestamp = event.timestamp.getTime();
+
+  return transcript.some((existingEvent) => {
+    if (existingEvent.speaker !== event.speaker || normalizeTranscriptText(existingEvent.text) !== normalizedText) {
+      return false;
+    }
+
+    return Math.abs(existingEvent.timestamp.getTime() - timestamp) <= duplicateTranscriptWindowMs;
+  });
+}
+
+function normalizeTranscriptText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
 }
 
 export function formatDateTime(date?: Date): string {
