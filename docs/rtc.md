@@ -68,7 +68,15 @@ bun run agent:validate-volcengine
 
 这个命令会用同一组 `ARK_*`、`VOLC_ASR_*`、`VOLC_TTS_*` 环境变量跑一遍 `TTS -> ASR -> Ark -> TTS`。它验证的是火山级联可用性，不会连接 LiveKit room。
 
-本地启动顺序：
+本地 LiveKit 调试推荐使用组合命令：
+
+```bash
+bun run dev:livekit
+```
+
+这个命令会同时启动 Vite 网页和 LiveKit Agent worker，并在其中一个进程退出或按下 `Ctrl-C` 时清理另一侧。如果需要指定 Vite 参数，可以继续转发，例如 `bun run dev:livekit -- --host 127.0.0.1 --port 5174`。
+
+如需拆分日志或单独排障，仍可分别运行：
 
 ```bash
 bun run agent:dev

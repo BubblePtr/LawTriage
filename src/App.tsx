@@ -23,6 +23,7 @@ import {
   createInitialAgentState,
   getAgentProviderMode,
 } from "./agentPipeline";
+import { createAgentSpeechPlaybackPreparation } from "./agentSpeechSync";
 import {
   appendTranscriptEvent,
   createAgentTranscriptEvent,
@@ -49,8 +50,23 @@ import {
   createMediaSessionAdapter,
   validateMediaSessionConfig,
 } from "./mediaSession";
+import {
+  createCompletedTranscriptPlayback,
+  createTranscriptPlayback,
+  splitTranscriptTextByProgress,
+  type TranscriptPlaybackState,
+} from "./transcriptPlayback";
+import {
+  createCompactVoicePipelineView,
+  createInitialVoicePipelineSnapshot,
+  getVoicePipelineStageStatusLabel,
+  reduceVoicePipelineSnapshot,
+  type VoicePipelineEvent,
+  type VoicePipelineSnapshot,
+  type VoicePipelineStage,
+} from "./voicePipeline";
 import type { CallStatus, DemoSession, IntakeForm, StructuredResult, TranscriptEvent, TriageSlotKey } from "./types";
-import type { AgentRuntimeState } from "./agentPipeline";
+import type { AgentRuntimeState, SpeechPlaybackCallbacks, SpeechPlaybackProgress } from "./agentPipeline";
 import type { MediaConnectionState, MediaSessionAdapter, MediaSessionConfig } from "./mediaSession";
 
 const defaultFixture = getDefaultDemoFixture();
@@ -97,8 +113,13 @@ function App() {
   const [mediaState, setMediaState] = useState<MediaConnectionState>(() =>
     createInitialMediaState(initialMediaConfig),
   );
+  const [transcriptPlaybackById, setTranscriptPlaybackById] = useState<Record<string, TranscriptPlaybackState>>({});
+  const [voicePipeline, setVoicePipeline] = useState<VoicePipelineSnapshot>(() =>
+    createInitialVoicePipelineSnapshot(),
+  );
   const [mediaTransitionPending, setMediaTransitionPending] = useState(false);
   const agentTurnQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const estimatedPlaybackTimersRef = useRef<number[]>([]);
   const mediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const pendingMediaSessionRef = useRef<MediaSessionAdapter | null>(null);
   const mediaConfigRef = useRef<MediaSessionConfig>(initialMediaConfig);
@@ -132,6 +153,7 @@ function App() {
 
   useEffect(() => {
     return () => {
+      clearEstimatedPlaybackTimers();
       void mediaSessionRef.current?.disconnect();
       void pendingMediaSessionRef.current?.disconnect();
     };
@@ -169,6 +191,9 @@ function App() {
     setSelectedFixtureId(fixture.id);
     setIntake({ ...fixture.intake });
     commitSession(null);
+    clearEstimatedPlaybackTimers();
+    setTranscriptPlaybackById({});
+    setVoicePipeline(createInitialVoicePipelineSnapshot());
     setElapsedSeconds(0);
     setAgentState(createIdleAgentStateForMediaConfig(mediaConfigRef.current));
   }
@@ -199,6 +224,142 @@ function App() {
   function commitSession(nextSession: DemoSession | null) {
     sessionRef.current = nextSession;
     setSession(nextSession);
+  }
+
+  function emitVoicePipelineEvent(event: VoicePipelineEvent) {
+    setVoicePipeline((current) => reduceVoicePipelineSnapshot(current, event));
+  }
+
+  function resetVoicePipeline(at = new Date()) {
+    setVoicePipeline(createInitialVoicePipelineSnapshot(at));
+  }
+
+  function clearEstimatedPlaybackTimers() {
+    for (const timer of estimatedPlaybackTimersRef.current) {
+      window.clearInterval(timer);
+    }
+
+    estimatedPlaybackTimersRef.current = [];
+  }
+
+  function updateTranscriptPlayback(transcriptId: string, progress: SpeechPlaybackProgress) {
+    setTranscriptPlaybackById((current) => ({
+      ...current,
+      [transcriptId]: createTranscriptPlayback(progress),
+    }));
+  }
+
+  function completeTranscriptPlayback(transcriptId: string) {
+    setTranscriptPlaybackById((current) => ({
+      ...current,
+      [transcriptId]: createCompletedTranscriptPlayback(current[transcriptId]),
+    }));
+  }
+
+  function prepareAgentSpeechPlayback(replyEvent: TranscriptEvent, latestSession = sessionRef.current): boolean {
+    if (!latestSession || latestSession.status !== "active") {
+      return false;
+    }
+
+    const prepared = createAgentSpeechPlaybackPreparation(latestSession, replyEvent);
+
+    commitSession(prepared.session);
+    setTranscriptPlaybackById((current) => ({
+      ...current,
+      [replyEvent.id]: prepared.playback,
+    }));
+    emitVoicePipelineEvent({
+      detail: "Agent 回复字幕已准备同步显示。",
+      stage: "transcript",
+      status: "active",
+    });
+
+    return true;
+  }
+
+  function createAgentSpeechPlaybackCallbacks(replyEvent: TranscriptEvent): SpeechPlaybackCallbacks {
+    return {
+      onPlaybackEnd: () => {
+        completeTranscriptPlayback(replyEvent.id);
+        emitVoicePipelineEvent({
+          detail: "Agent 语音播放完成。",
+          stage: "playback",
+          status: "done",
+        });
+        emitVoicePipelineEvent({
+          detail: "Agent 回复字幕已写回。",
+          stage: "transcript",
+          status: "done",
+        });
+      },
+      onPlaybackStart: () => {
+        updateTranscriptPlayback(replyEvent.id, {
+          elapsedMs: 0,
+          progress: 0,
+          text: replyEvent.text,
+        });
+        emitVoicePipelineEvent({
+          detail: "TTS 音频已开始播放。",
+          stage: "tts",
+          status: "done",
+        });
+        emitVoicePipelineEvent({
+          detail: "Agent 语音正在播放。",
+          stage: "playback",
+          status: "active",
+        });
+        emitVoicePipelineEvent({
+          detail: "Agent 回复字幕同步显示中。",
+          stage: "transcript",
+          status: "active",
+        });
+      },
+      onProgress: (progress) => updateTranscriptPlayback(replyEvent.id, progress),
+    };
+  }
+
+  function startEstimatedAgentPlayback(event: TranscriptEvent) {
+    const durationMs = estimateTranscriptPlaybackDurationMs(event.text);
+    const startedAt = performance.now();
+
+    updateTranscriptPlayback(event.id, {
+      durationMs,
+      elapsedMs: 0,
+      progress: 0,
+      text: event.text,
+    });
+    emitVoicePipelineEvent({
+      detail: "LiveKit Agent 回复字幕同步显示中。",
+      stage: "transcript",
+      status: "active",
+    });
+
+    const timer = window.setInterval(() => {
+      const elapsedMs = Math.max(0, performance.now() - startedAt);
+      const progress = Math.min(1, elapsedMs / durationMs);
+
+      updateTranscriptPlayback(event.id, {
+        durationMs,
+        elapsedMs: Math.round(elapsedMs),
+        progress,
+        text: event.text,
+      });
+
+      if (progress < 1) {
+        return;
+      }
+
+      window.clearInterval(timer);
+      estimatedPlaybackTimersRef.current = estimatedPlaybackTimersRef.current.filter((candidate) => candidate !== timer);
+      completeTranscriptPlayback(event.id);
+      emitVoicePipelineEvent({
+        detail: "LiveKit Agent 回复字幕已写回。",
+        stage: "transcript",
+        status: "done",
+      });
+    }, 120);
+
+    estimatedPlaybackTimersRef.current.push(timer);
   }
 
   function enqueueMediaTranscriptEvent(event: TranscriptEvent) {
@@ -246,8 +407,27 @@ function App() {
       text: acceptedEvent.text,
       transcriptLength: sessionWithInput.transcript.length,
     });
+    emitVoicePipelineEvent({
+      detail: acceptedEvent.speaker === "client" ? "客户转写已写入会话。" : "Agent 回复字幕已写入会话。",
+      stage: "transcript",
+      status: acceptedEvent.speaker === "client" ? "done" : "active",
+    });
 
     if (shouldUseLiveKitRoomAgent(mediaConfigRef.current)) {
+      if (acceptedEvent.speaker === "agent") {
+        emitVoicePipelineEvent({
+          detail: "LiveKit Agent 回复已生成。",
+          stage: "tts",
+          status: "done",
+        });
+        startEstimatedAgentPlayback(acceptedEvent);
+      } else {
+        emitVoicePipelineEvent({
+          detail: "LiveKit Agent 正在房间内生成回复。",
+          stage: "llm",
+          status: "active",
+        });
+      }
       setAgentState({
         providerLabel: getAgentRuntimeProviderLabel(mediaConfigRef.current),
         status: acceptedEvent.speaker === "client" ? "thinking" : "listening",
@@ -269,6 +449,11 @@ function App() {
       status: "thinking",
       detail: "Agent 正在生成接待回复。",
     });
+    emitVoicePipelineEvent({
+      detail: "Agent 正在生成接待回复。",
+      stage: "llm",
+      status: "active",
+    });
 
     try {
       const turnIndex = sessionWithInput.transcript.filter((item) => item.speaker === "client").length;
@@ -283,6 +468,11 @@ function App() {
         turnIndex,
       });
       logAgentFlow("LLM reply", replyText);
+      emitVoicePipelineEvent({
+        detail: "Agent 回复文本已生成。",
+        stage: "llm",
+        status: "done",
+      });
       const latestSession = sessionRef.current;
 
       if (!latestSession || latestSession.status !== "active") {
@@ -292,16 +482,23 @@ function App() {
       setAgentState({
         providerLabel: agentProviders.label,
         status: "speaking",
-        detail: "Agent 回复已生成，正在写回字幕流。",
+        detail: "Agent 回复已生成，正在合成并播放语音。",
       });
-      await agentProviders.tts.synthesize(replyText);
+      emitVoicePipelineEvent({
+        detail: "正在合成 Agent 语音。",
+        stage: "tts",
+        status: "active",
+      });
+      const replyEvent = createAgentTranscriptEvent(replyText, new Date(Date.now() + 120));
+
+      if (!prepareAgentSpeechPlayback(replyEvent, latestSession)) {
+        return;
+      }
+
+      await waitForNextAnimationFrame();
+      await agentProviders.tts.synthesize(replyText, createAgentSpeechPlaybackCallbacks(replyEvent));
       logAgentFlow("TTS played");
 
-      const sessionWithReply = appendTranscriptEvent(
-        latestSession,
-        createAgentTranscriptEvent(replyText, new Date(Date.now() + 120)),
-      );
-      commitSession(sessionWithReply);
       setAgentState({
         providerLabel: agentProviders.label,
         status: "listening",
@@ -337,6 +534,9 @@ function App() {
       return;
     }
 
+    clearEstimatedPlaybackTimers();
+    setTranscriptPlaybackById({});
+    resetVoicePipeline();
     const nextSession = createDemoSession(intake, selectedScenario);
     const adapter = createMediaSessionAdapter(mediaConfig);
     pendingMediaSessionRef.current = adapter;
@@ -352,6 +552,11 @@ function App() {
         onStateChange: (nextState) => {
           if (pendingMediaSessionRef.current === adapter || mediaSessionRef.current === adapter) {
             setMediaState(nextState);
+          }
+        },
+        onPipelineEvent: (event) => {
+          if (pendingMediaSessionRef.current === adapter || mediaSessionRef.current === adapter) {
+            emitVoicePipelineEvent(event);
           }
         },
         onTranscriptEvent: (event) => {
@@ -378,10 +583,17 @@ function App() {
         return;
       }
 
+      commitSession(nextSession);
+      setElapsedSeconds(0);
       setAgentState({
         providerLabel: agentProviders.label,
         status: "thinking",
         detail: "Agent 正在生成开场话术。",
+      });
+      emitVoicePipelineEvent({
+        detail: "Agent 正在生成开场话术。",
+        stage: "llm",
+        status: "active",
       });
 
       const openingText = await agentProviders.llm.generateReply({
@@ -389,15 +601,30 @@ function App() {
         transcript: nextSession.transcript,
         turnIndex: 0,
       });
-      await agentProviders.tts.synthesize(openingText);
-      commitSession(appendTranscriptEvent(nextSession, createAgentTranscriptEvent(openingText)));
+      emitVoicePipelineEvent({
+        detail: "开场话术已生成。",
+        stage: "llm",
+        status: "done",
+      });
+      emitVoicePipelineEvent({
+        detail: "正在合成开场语音。",
+        stage: "tts",
+        status: "active",
+      });
+      const openingEvent = createAgentTranscriptEvent(openingText);
+
+      if (!prepareAgentSpeechPlayback(openingEvent)) {
+        return;
+      }
+
+      await waitForNextAnimationFrame();
+      await agentProviders.tts.synthesize(openingText, createAgentSpeechPlaybackCallbacks(openingEvent));
       setAgentState({
         providerLabel: agentProviders.label,
         status: "listening",
         detail: "Agent 已开场，等待客户输入。",
         lastReplyAt: new Date(),
       });
-      setElapsedSeconds(0);
     } catch (error) {
       await adapter.disconnect().catch(() => undefined);
       if (pendingMediaSessionRef.current === adapter) {
@@ -448,6 +675,11 @@ function App() {
     try {
       commitSession(endDemoSession(activeSession));
       await adapter?.disconnect({
+        onPipelineEvent: (event) => {
+          if (!adapter || mediaSessionRef.current === adapter) {
+            emitVoicePipelineEvent(event);
+          }
+        },
         onStateChange: (nextState) => {
           if (!adapter || mediaSessionRef.current === adapter) {
             setMediaState(nextState);
@@ -468,6 +700,9 @@ function App() {
         status: "idle",
         detail: "演示会话已结束。",
       });
+      clearEstimatedPlaybackTimers();
+      setTranscriptPlaybackById({});
+      resetVoicePipeline();
       setMediaTransition(false);
     }
   }
@@ -637,6 +872,7 @@ function App() {
             <MetricBlock label="通话状态" value={getStatusLabel(status)} />
             <MetricBlock label="通话时长" value={dashboardDuration} />
           </div>
+          <VoicePipelineTimeline snapshot={voicePipeline} />
           <div className="transcript-area">
             <div className="transcript-toolbar">
               <span className="toolbar-title">
@@ -647,7 +883,7 @@ function App() {
                 {status === "active" ? `Agent 对话 ${transcriptProgress}` : `转写事件 ${transcriptProgress}`}
               </span>
             </div>
-            <TranscriptFeed events={transcriptEvents} status={status} />
+            <TranscriptFeed events={transcriptEvents} playbackById={transcriptPlaybackById} status={status} />
             <ClientCaptionPreview event={latestTranscriptEvent} />
           </div>
           <div className="session-footer">
@@ -723,6 +959,36 @@ function MediaStatusBadge({ state }: { state: MediaConnectionState }) {
     <span className={`media-status media-status-${state.status}`}>
       {getMediaStatusLabel(state.status)}
     </span>
+  );
+}
+
+function VoicePipelineTimeline({ snapshot }: { snapshot: VoicePipelineSnapshot }) {
+  const view = createCompactVoicePipelineView(snapshot);
+  const currentStage = view.currentStage;
+  const detail = currentStage.error ?? currentStage.detail;
+
+  return (
+    <section className="voice-pipeline" aria-label="语音链路实时状态">
+      <div className="voice-pipeline-header">
+        <span className="toolbar-title">
+          <RadioTower size={16} />
+          语音链路
+        </span>
+      </div>
+      <div className={`voice-pipeline-body voice-pipeline-body-${currentStage.status}`}>
+        <p className="voice-pipeline-status">
+          <strong>{formatVoicePipelineHeadline(currentStage)}</strong>
+          <span>{formatVoicePipelineStartedAt(currentStage)}</span>
+        </p>
+        <p className="voice-pipeline-detail" title={detail}>
+          {detail}
+        </p>
+        <p className="voice-pipeline-mainline">
+          <span>主要环节</span>
+          {view.stageStatusText}
+        </p>
+      </div>
+    </section>
   );
 }
 
@@ -920,7 +1186,15 @@ function getResultSlotValue(result: StructuredResult | undefined, key: TriageSlo
   return getTriageSlotValue(result.triageSlots, key);
 }
 
-function TranscriptFeed({ events, status }: { events: TranscriptEvent[]; status: CallStatus }) {
+function TranscriptFeed({
+  events,
+  playbackById,
+  status,
+}: {
+  events: TranscriptEvent[];
+  playbackById: Record<string, TranscriptPlaybackState>;
+  status: CallStatus;
+}) {
   if (events.length === 0) {
     return (
       <div className="transcript-empty">
@@ -933,16 +1207,42 @@ function TranscriptFeed({ events, status }: { events: TranscriptEvent[]; status:
 
   return (
     <ol className="transcript-feed" aria-label="实时通话转写">
-      {events.map((event) => (
-        <li className={`transcript-line transcript-${event.speaker}`} key={event.id}>
-          <div className="transcript-meta">
-            <span>{getTranscriptSpeakerLabel(event)}</span>
-            <time dateTime={event.timestamp.toISOString()}>{formatTranscriptTime(event.timestamp)}</time>
-          </div>
-          <p>{event.text}</p>
-        </li>
-      ))}
+      {events.map((event) => {
+        const playback = playbackById[event.id];
+
+        return (
+          <li className={`transcript-line transcript-${event.speaker}`} key={event.id}>
+            <div className="transcript-meta">
+              <span>{getTranscriptSpeakerLabel(event)}</span>
+              <time dateTime={event.timestamp.toISOString()}>{formatTranscriptTime(event.timestamp)}</time>
+            </div>
+            <p>
+              <TranscriptText event={event} playback={playback} />
+            </p>
+            {event.speaker === "agent" && playback?.status === "playing" ? (
+              <span className="transcript-playback-meter" aria-hidden="true">
+                <span style={{ width: `${Math.round(playback.progress * 100)}%` }} />
+              </span>
+            ) : null}
+          </li>
+        );
+      })}
     </ol>
+  );
+}
+
+function TranscriptText({ event, playback }: { event: TranscriptEvent; playback?: TranscriptPlaybackState }) {
+  if (event.speaker !== "agent" || !playback || playback.status === "complete") {
+    return <>{event.text}</>;
+  }
+
+  const reveal = splitTranscriptTextByProgress(event.text, playback.progress);
+
+  return (
+    <span className="transcript-reveal" aria-label={event.text}>
+      <span className="transcript-spoken">{reveal.spokenText}</span>
+      <span className="transcript-pending">{reveal.pendingText}</span>
+    </span>
   );
 }
 
@@ -988,6 +1288,14 @@ function getSecondsBetween(start: Date, end: Date): number {
   return Math.floor((end.getTime() - start.getTime()) / 1000);
 }
 
+function estimateTranscriptPlaybackDurationMs(text: string): number {
+  return Math.max(900, Array.from(text.replace(/\s+/g, "")).length * 75);
+}
+
+function waitForNextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
 function isValidIntake(intake: IntakeForm): boolean {
   return Boolean(intake.phone.trim() && intake.clientName.trim() && intake.city.trim());
 }
@@ -1026,6 +1334,22 @@ function getMediaStatusLabel(status: MediaConnectionState["status"]): string {
   }
 
   return "未连接";
+}
+
+function formatVoicePipelineHeadline(stage: VoicePipelineStage): string {
+  if (stage.status === "idle" && stage.id === "media") {
+    return "等待语音链路开始";
+  }
+
+  return `${stage.label} ${getVoicePipelineStageStatusLabel(stage.status)}`;
+}
+
+function formatVoicePipelineStartedAt(stage: VoicePipelineStage): string {
+  if (!stage.updatedAt || stage.status === "idle") {
+    return "尚未开始";
+  }
+
+  return `开始于 ${formatTranscriptTime(stage.updatedAt)}`;
 }
 
 function getAgentStatusLabel(status: AgentRuntimeState["status"]): string {
