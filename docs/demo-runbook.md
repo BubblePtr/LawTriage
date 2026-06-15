@@ -47,8 +47,8 @@
 1. 确认 `.env.local` 有 `VITE_LIVEKIT_URL`、`LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET`；浏览器 participant token 会由本地后端短期签发。
 2. 先运行 `bun run agent:validate-volcengine`，确认本地火山 `TTS -> ASR -> Ark -> TTS` 级联可用。
 3. 如需真实 Agent，确认 `.env.local` 有 `LIVEKIT_URL`、`LIVEKIT_API_KEY`、`LIVEKIT_API_SECRET`、`AGENT_PROVIDER=volcengine` 和火山 `ARK_*` / `VOLC_*` 配置。
-4. 启动 `bun run agent:dev`。
-5. 重启 `bun run dev`。
+4. 启动 `bun run dev:livekit`。
+5. 如果需要拆分排障，再分别运行 `bun run agent:dev` 和 `bun run dev`。
 6. 左侧媒体模式选择 `LiveKit`。
 7. 点击“开始咨询”，浏览器允许麦克风。
 8. 确认 RTC 状态进入“已连接”，并在失败时检查 UI 展示的明确错误。

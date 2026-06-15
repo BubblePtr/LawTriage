@@ -2,6 +2,7 @@ import { createMockClientTranscriptEvent, getMockClientTranscriptLength } from "
 import { getAgentProviderMode, type AgentProviderKind } from "./agentPipeline";
 import { lawTriageAgentReplyTopic } from "./livekitTopics";
 import type { DemoSession, TranscriptEvent } from "./types";
+import type { VoicePipelineEvent } from "./voicePipeline";
 
 export type MediaSessionMode = "mock" | "browser" | "livekit";
 
@@ -27,6 +28,7 @@ export type MediaConnectionState = {
 };
 
 export type MediaSessionHandlers = {
+  onPipelineEvent?: (event: VoicePipelineEvent) => void;
   onStateChange: (state: MediaConnectionState) => void;
   onTranscriptEvent?: (event: TranscriptEvent) => void;
 };
@@ -195,11 +197,50 @@ function createLiveKitAudioPlaybackState(playing: boolean, error?: unknown): Med
   return state;
 }
 
+function getLiveKitAudioPlaybackPipelineEvent(
+  playing: boolean,
+  wasPlaying: boolean,
+): {
+  event?: VoicePipelineEvent;
+  nextWasPlaying: boolean;
+} {
+  if (playing) {
+    return {
+      event: {
+        detail: "LiveKit Agent 远端音频正在播放。",
+        stage: "playback",
+        status: "active",
+      },
+      nextWasPlaying: true,
+    };
+  }
+
+  if (!wasPlaying) {
+    return {
+      nextWasPlaying: false,
+    };
+  }
+
+  return {
+    event: {
+      detail: "LiveKit Agent 远端音频播放完成。",
+      stage: "playback",
+      status: "done",
+    },
+    nextWasPlaying: false,
+  };
+}
+
 class MockMediaSessionAdapter implements MediaSessionAdapter {
   private transcriptTimers: number[] = [];
 
   async connect(session: DemoSession, handlers: MediaSessionHandlers) {
     clearTranscriptTimers(this.transcriptTimers);
+    handlers.onPipelineEvent?.({
+      detail: `正在建立 Dev Mock MediaSession：${session.id}`,
+      stage: "media",
+      status: "active",
+    });
     handlers.onStateChange({
       mode: "mock",
       status: "connecting",
@@ -212,6 +253,16 @@ class MockMediaSessionAdapter implements MediaSessionAdapter {
       mode: "mock",
       status: "connected",
       detail: "Dev Mock 已接通，浏览器音频链路由模拟字幕事件驱动。",
+    });
+    handlers.onPipelineEvent?.({
+      detail: "Dev Mock 已接通。",
+      stage: "media",
+      status: "done",
+    });
+    handlers.onPipelineEvent?.({
+      detail: "使用模拟麦克风输入。",
+      stage: "microphone",
+      status: "done",
     });
 
     this.transcriptTimers = scheduleDemoTranscriptEvents(session, handlers);
@@ -242,6 +293,11 @@ class BrowserMicMediaSessionAdapter implements MediaSessionAdapter {
   async connect(session: DemoSession, handlers: MediaSessionHandlers) {
     this.audioTranscription?.stop();
     this.audioTranscription = undefined;
+    handlers.onPipelineEvent?.({
+      detail: `正在打开本机麦克风：${session.id}`,
+      stage: "media",
+      status: "active",
+    });
     handlers.onStateChange({
       mode: "browser",
       status: "connecting",
@@ -266,6 +322,16 @@ class BrowserMicMediaSessionAdapter implements MediaSessionAdapter {
       mode: "browser",
       status: "connected",
       detail: `本机麦克风已接通，${getAsrProviderLabel()} 正在监听。`,
+    });
+    handlers.onPipelineEvent?.({
+      detail: "本机媒体连接已建立。",
+      stage: "media",
+      status: "done",
+    });
+    handlers.onPipelineEvent?.({
+      detail: "本机麦克风已接通。",
+      stage: "microphone",
+      status: "done",
     });
   }
 
@@ -293,6 +359,7 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
   private localMicActivityMonitor?: LiveKitMicActivityMonitor;
   private receivedAgentReplyIds = new Set<string>();
   private receivedTranscriptionSegmentIds = new Set<string>();
+  private remoteAudioWasPlaying = false;
   private remoteAudioElements = new Map<
     string,
     {
@@ -306,6 +373,11 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
   constructor(private readonly config: MediaSessionConfig) {}
 
   async connect(session: DemoSession, handlers: MediaSessionHandlers) {
+    handlers.onPipelineEvent?.({
+      detail: `正在连接 LiveKit room：${session.id}`,
+      stage: "media",
+      status: "active",
+    });
     handlers.onStateChange({
       mode: "livekit",
       status: "connecting",
@@ -326,12 +398,22 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
 
       const credentials = await resolveLiveKitCredentials(this.config, session);
       await room.connect(credentials.url, credentials.token);
+      handlers.onPipelineEvent?.({
+        detail: `LiveKit room 已连接：${credentials.roomName}`,
+        stage: "media",
+        status: "done",
+      });
       const microphonePublication = await room.localParticipant.setMicrophoneEnabled(
         true,
         getRealtimeAudioCaptureOptions(),
         getLiveKitMicPublishOptions(),
       );
       this.startLocalMicActivityMonitor(microphonePublication);
+      handlers.onPipelineEvent?.({
+        detail: "LiveKit 麦克风音轨已发布。",
+        stage: "microphone",
+        status: "done",
+      });
 
       handlers.onStateChange({
         mode: "livekit",
@@ -350,6 +432,7 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       this.stopLocalMicActivityMonitor();
       this.receivedAgentReplyIds.clear();
       this.receivedTranscriptionSegmentIds.clear();
+      this.remoteAudioWasPlaying = false;
       clearTranscriptTimers(this.transcriptTimers);
       this.transcriptTimers = [];
       if (room) {
@@ -370,6 +453,12 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
         detail: "LiveKit 连接失败，已断开临时 room。",
         error: getErrorMessage(error),
       });
+      handlers.onPipelineEvent?.({
+        detail: "LiveKit 连接失败。",
+        error: getErrorMessage(error),
+        stage: "media",
+        status: "failed",
+      });
       throw error;
     }
   }
@@ -384,6 +473,7 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
     this.stopLocalMicActivityMonitor();
     this.receivedAgentReplyIds.clear();
     this.receivedTranscriptionSegmentIds.clear();
+    this.remoteAudioWasPlaying = false;
     activeHandlers?.onStateChange({
       mode: "livekit",
       status: "disconnecting",
@@ -451,6 +541,7 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       this.stopLocalMicActivityMonitor();
       this.receivedAgentReplyIds.clear();
       this.receivedTranscriptionSegmentIds.clear();
+      this.remoteAudioWasPlaying = false;
       handlers.onStateChange({
         mode: "livekit",
         status: "disconnected",
@@ -467,6 +558,11 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
         mode: "livekit",
         status: "connected",
         detail: `LiveKit Agent 已加入房间：${participant.identity}。`,
+      });
+      handlers.onPipelineEvent?.({
+        detail: `LiveKit Agent 已加入房间：${participant.identity}`,
+        stage: "asr",
+        status: "pending",
       });
     });
 
@@ -517,6 +613,12 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
     room.on(RoomEvent.AudioPlaybackStatusChanged, (playing) => {
       console.info("[LawTriage LiveKit audio] playback status changed", { playing });
       emitIfCurrent(createLiveKitAudioPlaybackState(playing));
+      const playbackPipeline = getLiveKitAudioPlaybackPipelineEvent(playing, this.remoteAudioWasPlaying);
+
+      this.remoteAudioWasPlaying = playbackPipeline.nextWasPlaying;
+      if (playbackPipeline.event) {
+        handlers.onPipelineEvent?.(playbackPipeline.event);
+      }
     });
 
     room.on(RoomEvent.MediaDevicesError, (error) => {
@@ -701,6 +803,11 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
         text,
         timestamp: new Date(segment.lastReceivedTime),
       });
+      this.handlers?.onPipelineEvent?.({
+        detail: "LiveKit 已收到客户最终转写。",
+        stage: "asr",
+        status: "done",
+      });
     }
   }
 
@@ -754,6 +861,11 @@ class LiveKitMediaSessionAdapter implements MediaSessionAdapter {
       console.info("[LawTriage LiveKit transcript] agent reply stream received", {
         id: payload.id,
         textLength: payload.text.length,
+      });
+      this.handlers?.onPipelineEvent?.({
+        detail: "LiveKit Agent 回复文本流已到达。",
+        stage: "transcript",
+        status: "active",
       });
       this.handlers?.onTranscriptEvent?.(createLiveKitAgentReplyTranscriptEvent(payload));
     } catch (error) {
@@ -906,6 +1018,11 @@ class BrowserAudioTranscriptionSession {
         return;
       }
 
+      handlers.onPipelineEvent?.({
+        detail: "检测到本机麦克风音频片段。",
+        stage: "speech",
+        status: "active",
+      });
       this.enqueueTranscription(event.data, handlers);
     };
     recorder.start(4200);
@@ -982,6 +1099,11 @@ class BrowserAudioTranscriptionSession {
       if (hasSpeech && !this.firstSpeechLogged) {
         this.firstSpeechLogged = true;
         console.info("[LawTriage ASR] speech detected, opening ASR relay");
+        handlers.onPipelineEvent?.({
+          detail: "检测到客户语音。",
+          stage: "speech",
+          status: "active",
+        });
       }
 
       this.enqueuePcm(pcm, handlers);
@@ -1024,6 +1146,11 @@ class BrowserAudioTranscriptionSession {
     this.asrSocket = socket;
     this.asrFinalizing = false;
     console.info("[LawTriage ASR] relay connecting");
+    handlers.onPipelineEvent?.({
+      detail: "正在连接火山 ASR relay。",
+      stage: "asr",
+      status: "active",
+    });
     this.asrConnecting = this.waitForVolcAsrReady(socket, handlers)
       .then(() => {
         if (this.asrSocket === socket && socket.readyState === WebSocket.OPEN) {
@@ -1039,6 +1166,12 @@ class BrowserAudioTranscriptionSession {
             error: getErrorMessage(error),
           });
         }
+        handlers.onPipelineEvent?.({
+          detail: "火山 ASR relay 连接失败。",
+          error: getErrorMessage(error),
+          stage: "asr",
+          status: "failed",
+        });
         this.clearOutboundPcm();
         if (this.asrSocket === socket) {
           this.asrSocket = undefined;
@@ -1069,6 +1202,11 @@ class BrowserAudioTranscriptionSession {
         if (message.type === "ready") {
           cleanup();
           console.info("[LawTriage ASR] relay ready");
+          handlers.onPipelineEvent?.({
+            detail: "火山 ASR relay 已就绪。",
+            stage: "asr",
+            status: "active",
+          });
           socket.onmessage = (nextEvent) => this.handleVolcAsrMessage(nextEvent.data, handlers);
           socket.onerror = () => {
             if (!this.stopped) {
@@ -1133,6 +1271,12 @@ class BrowserAudioTranscriptionSession {
         detail: "火山 ASR 转写失败。",
         error: message.message ?? "火山 ASR 返回错误。",
       });
+      handlers.onPipelineEvent?.({
+        detail: "火山 ASR 转写失败。",
+        error: message.message ?? "火山 ASR 返回错误。",
+        stage: "asr",
+        status: "failed",
+      });
       return;
     }
 
@@ -1147,6 +1291,11 @@ class BrowserAudioTranscriptionSession {
     }
 
     console.info("[LawTriage ASR] definite transcript", text);
+    handlers.onPipelineEvent?.({
+      detail: "火山 ASR 已返回稳定分句。",
+      stage: "asr",
+      status: "active",
+    });
     this.lastDefiniteAt = performance.now();
     this.lastText = text;
     this.queueClientTurnText(text, handlers);
@@ -1209,6 +1358,11 @@ class BrowserAudioTranscriptionSession {
     }
 
     console.info("[LawTriage ASR] client turn flushed", pendingText);
+    handlers.onPipelineEvent?.({
+      detail: "客户轮次转写已提交。",
+      stage: "asr",
+      status: "done",
+    });
     handlers.onTranscriptEvent?.({
       id: `tr-${Date.now()}-volc-${Math.random().toString(16).slice(2, 6)}`,
       speaker: "client",
@@ -1356,6 +1510,11 @@ class BrowserAudioTranscriptionSession {
   }
 
   private async transcribe(blob: Blob, handlers: MediaSessionHandlers) {
+    handlers.onPipelineEvent?.({
+      detail: `${getAsrProviderLabel()} 正在转写音频片段。`,
+      stage: "asr",
+      status: "active",
+    });
     const response = await fetch("/api/agent/transcribe", {
       method: "POST",
       headers: {
@@ -1391,6 +1550,11 @@ class BrowserAudioTranscriptionSession {
     }
 
     this.lastText = text;
+    handlers.onPipelineEvent?.({
+      detail: `${getAsrProviderLabel()} 已返回文本。`,
+      stage: "asr",
+      status: "done",
+    });
     if (this.stopped) {
       return;
     }
@@ -1416,6 +1580,16 @@ function scheduleDemoTranscriptEvents(session: DemoSession, handlers: MediaSessi
       const event = createMockClientTranscriptEvent(session, index);
 
       if (event) {
+        handlers.onPipelineEvent?.({
+          detail: "Dev Mock 生成客户文本事件。",
+          stage: "speech",
+          status: "active",
+        });
+        handlers.onPipelineEvent?.({
+          detail: "Dev Mock ASR 已产出文本。",
+          stage: "asr",
+          status: "done",
+        });
         handlers.onTranscriptEvent?.(event);
       }
     }, 1500 + index * 3200);
@@ -1730,6 +1904,7 @@ export const parseLiveKitAgentReplyStreamTextForTest = parseLiveKitAgentReplyStr
 export const parseLiveKitTranscriptionStreamTextForTest = parseLiveKitTranscriptionStreamText;
 export const resolveInitialMediaModeForTest = resolveInitialMediaMode;
 export const createLiveKitAudioPlaybackStateForTest = createLiveKitAudioPlaybackState;
+export const getLiveKitAudioPlaybackPipelineEventForTest = getLiveKitAudioPlaybackPipelineEvent;
 export const getLiveKitMicPublishOptionsForTest = getLiveKitMicPublishOptions;
 export const isLiveKitMicAudioActiveForTest = isLiveKitMicAudioActive;
 export const shouldAcceptLiveKitTranscriptionSpeakerForTest = shouldAcceptLiveKitTranscriptionSpeaker;

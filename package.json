@@ -7,6 +7,7 @@
     "agent:dev": "bun run agent/lawTriageAgent.ts dev",
     "agent:validate-volcengine": "bun run agent/validateVolcengineChain.ts",
     "agent:start": "bun run agent/lawTriageAgent.ts start",
+    "dev:livekit": "bun run scripts/devLivekit.ts",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview"

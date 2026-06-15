@@ -13,6 +13,19 @@ export type AgentRuntimeState = {
   lastReplyAt?: Date;
 };
 
+export type SpeechPlaybackProgress = {
+  durationMs?: number;
+  elapsedMs: number;
+  progress: number;
+  text: string;
+};
+
+export type SpeechPlaybackCallbacks = {
+  onPlaybackEnd?: () => void;
+  onPlaybackStart?: () => void;
+  onProgress?: (progress: SpeechPlaybackProgress) => void;
+};
+
 export type AgentReplyRequest = {
   clientEvent?: TranscriptEvent;
   session: DemoSession;
@@ -36,7 +49,7 @@ export type LlmProvider = {
 export type TtsProvider = {
   kind: AgentProviderKind;
   label: string;
-  synthesize: (text: string) => Promise<void>;
+  synthesize: (text: string, callbacks?: SpeechPlaybackCallbacks) => Promise<void>;
 };
 
 export type AgentProviderBundle = {
@@ -126,7 +139,7 @@ function createOpenAiTtsProvider(): TtsProvider {
   return {
     kind: "openai",
     label: "OpenAI Speech",
-    async synthesize(text) {
+    async synthesize(text, callbacks) {
       const response = await fetch("/api/agent/speech", {
         method: "POST",
         headers: {
@@ -139,7 +152,7 @@ function createOpenAiTtsProvider(): TtsProvider {
         throw new Error(await readErrorMessage(response, "OpenAI TTS 请求失败。"));
       }
 
-      await playSpeechBlob(await response.blob());
+      await playSpeechBlob(await response.blob(), text, callbacks);
     },
   };
 }
@@ -181,7 +194,7 @@ function createVolcengineTtsProvider(): TtsProvider {
   return {
     kind: "volcengine",
     label: "Volcengine Seed TTS",
-    async synthesize(text) {
+    async synthesize(text, callbacks) {
       const response = await fetch("/api/agent/speech", {
         method: "POST",
         headers: {
@@ -194,7 +207,7 @@ function createVolcengineTtsProvider(): TtsProvider {
         throw new Error(await readErrorMessage(response, "火山 TTS 请求失败。"));
       }
 
-      await playSpeechBlob(await response.blob());
+      await playSpeechBlob(await response.blob(), text, callbacks);
     },
   };
 }
@@ -248,30 +261,134 @@ async function readErrorMessage(response: Response, fallback: string): Promise<s
   }
 }
 
-async function playSpeechBlob(blob: Blob): Promise<void> {
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
+type SpeechPlaybackRuntime = {
+  clearProgressTimer?: (timer: number) => void;
+  createAudioElement: (url: string) => HTMLAudioElement;
+  createObjectUrl: (blob: Blob) => string;
+  dispatchWindowEvent: (event: Event) => void;
+  now?: () => number;
+  revokeObjectUrl: (url: string) => void;
+  setProgressTimer?: (callback: () => void, intervalMs: number) => number;
+};
 
-  window.dispatchEvent(new Event("lawtriage:tts-start"));
+function createBrowserSpeechPlaybackRuntime(): SpeechPlaybackRuntime {
+  return {
+    clearProgressTimer: (timer) => window.clearInterval(timer),
+    createAudioElement: (url) => new Audio(url),
+    createObjectUrl: (blob) => URL.createObjectURL(blob),
+    dispatchWindowEvent: (event) => window.dispatchEvent(event),
+    now: () => performance.now(),
+    revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+    setProgressTimer: (callback, intervalMs) => window.setInterval(callback, intervalMs),
+  };
+}
+
+async function playSpeechBlob(
+  blob: Blob,
+  text: string,
+  callbacks: SpeechPlaybackCallbacks = {},
+  runtime = createBrowserSpeechPlaybackRuntime(),
+): Promise<void> {
+  const url = runtime.createObjectUrl(blob);
+  const audio = runtime.createAudioElement(url);
+  let playbackStarted = false;
+  let playbackEnded = false;
+  let playbackStartedAt = 0;
+  let progressTimer: number | undefined;
+  let lastProgress = 0;
+
+  const emitProgress = (progress: number) => {
+    const durationMs = getSpeechDurationMs(audio, text);
+    const nextProgress = playbackEnded
+      ? clampProgress(progress)
+      : Math.min(0.98, Math.max(lastProgress, clampProgress(progress)));
+    const elapsedMs = Math.round(nextProgress * durationMs);
+
+    lastProgress = nextProgress;
+
+    callbacks.onProgress?.({
+      durationMs,
+      elapsedMs,
+      progress: nextProgress,
+      text,
+    });
+  };
+  const stopProgressTimer = () => {
+    if (progressTimer === undefined) {
+      return;
+    }
+
+    runtime.clearProgressTimer?.(progressTimer);
+    progressTimer = undefined;
+  };
+  const startProgressTimer = () => {
+    if (progressTimer !== undefined || !runtime.setProgressTimer) {
+      return;
+    }
+
+    progressTimer = runtime.setProgressTimer(() => {
+      if (!playbackStarted || playbackEnded) {
+        return;
+      }
+
+      emitProgress(getInterpolatedSpeechProgress(audio, text, playbackStartedAt, runtime.now?.() ?? Date.now()));
+    }, 80);
+  };
+  const startPlayback = () => {
+    if (playbackStarted) {
+      return;
+    }
+
+    playbackStarted = true;
+    playbackStartedAt = runtime.now?.() ?? Date.now();
+    runtime.dispatchWindowEvent(new Event("lawtriage:tts-start"));
+    callbacks.onPlaybackStart?.();
+    emitProgress(0);
+    startProgressTimer();
+  };
+  const finishPlayback = () => {
+    if (playbackEnded) {
+      return;
+    }
+
+    playbackEnded = true;
+    stopProgressTimer();
+    emitProgress(1);
+    callbacks.onPlaybackEnd?.();
+    runtime.dispatchWindowEvent(new Event("lawtriage:tts-end"));
+  };
 
   try {
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
-        audio.onended = null;
-        audio.onerror = null;
+        audio.removeEventListener("ended", handleEnded);
+        audio.removeEventListener("error", handleError);
+        audio.removeEventListener("loadedmetadata", handleProgress);
+        audio.removeEventListener("timeupdate", handleProgress);
       };
 
       const finish = () => {
+        finishPlayback();
         cleanup();
         resolve();
       };
       const fail = (error: unknown) => {
+        stopProgressTimer();
         cleanup();
         reject(error instanceof Error ? error : new Error("TTS 音频播放失败。"));
       };
+      const handleEnded = () => finish();
+      const handleError = () => fail(new Error(getAudioPlaybackErrorMessage(audio.error)));
+      const handleProgress = () => {
+        startPlayback();
+        emitProgress(getCurrentSpeechProgress(audio, text));
+      };
 
-      audio.onended = finish;
-      audio.onerror = () => fail(new Error(getAudioPlaybackErrorMessage(audio.error)));
+      audio.addEventListener("ended", handleEnded);
+      audio.addEventListener("error", handleError);
+      audio.addEventListener("loadedmetadata", handleProgress);
+      audio.addEventListener("timeupdate", handleProgress);
+      startPlayback();
       const playPromise = audio.play();
 
       if (playPromise) {
@@ -279,9 +396,54 @@ async function playSpeechBlob(blob: Blob): Promise<void> {
       }
     });
   } finally {
-    window.dispatchEvent(new Event("lawtriage:tts-end"));
-    URL.revokeObjectURL(url);
+    stopProgressTimer();
+    if (playbackStarted && !playbackEnded) {
+      runtime.dispatchWindowEvent(new Event("lawtriage:tts-end"));
+    }
+    runtime.revokeObjectUrl(url);
   }
+}
+
+function getInterpolatedSpeechProgress(
+  audio: HTMLAudioElement,
+  text: string,
+  playbackStartedAt: number,
+  now: number,
+): number {
+  const audioProgress = getCurrentSpeechProgress(audio, text);
+  const durationMs = getSpeechDurationMs(audio, text);
+  const elapsedProgress = Math.max(0, now - playbackStartedAt) / durationMs;
+
+  return Math.max(audioProgress, elapsedProgress);
+}
+
+function getCurrentSpeechProgress(audio: HTMLAudioElement, text: string): number {
+  const durationMs = getSpeechDurationMs(audio, text);
+  const elapsedMs = Math.max(0, audio.currentTime * 1000);
+
+  return elapsedMs / durationMs;
+}
+
+function getSpeechDurationMs(audio: HTMLAudioElement, text: string): number {
+  if (Number.isFinite(audio.duration) && audio.duration > 0) {
+    return Math.max(1, Math.round(audio.duration * 1000));
+  }
+
+  return estimateSpeechDurationMs(text);
+}
+
+function estimateSpeechDurationMs(text: string): number {
+  const visibleCharacterCount = Array.from(text.replace(/\s+/g, "")).length;
+
+  return Math.max(800, visibleCharacterCount * 75);
+}
+
+function clampProgress(progress: number): number {
+  if (!Number.isFinite(progress)) {
+    return 0;
+  }
+
+  return Math.min(1, Math.max(0, progress));
 }
 
 function getAudioPlaybackErrorMessage(error: MediaError | null): string {
@@ -326,8 +488,35 @@ function createDevTtsProvider(): TtsProvider {
   return {
     kind: "dev",
     label: "Dev Text TTS",
-    async synthesize() {
-      return undefined;
+    async synthesize(text, callbacks) {
+      const durationMs = Math.min(1800, estimateSpeechDurationMs(text));
+      const frameCount = Math.max(3, Math.ceil(durationMs / 180));
+
+      callbacks?.onPlaybackStart?.();
+      callbacks?.onProgress?.({
+        durationMs,
+        elapsedMs: 0,
+        progress: 0,
+        text,
+      });
+
+      for (let frame = 1; frame <= frameCount; frame += 1) {
+        await wait(durationMs / frameCount);
+        callbacks?.onProgress?.({
+          durationMs,
+          elapsedMs: Math.round((durationMs * frame) / frameCount),
+          progress: frame / frameCount,
+          text,
+        });
+      }
+
+      callbacks?.onPlaybackEnd?.();
     },
   };
 }
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+export const playSpeechBlobForTest = playSpeechBlob;

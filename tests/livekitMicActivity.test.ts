@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   createLiveKitAudioPlaybackStateForTest,
+  getLiveKitAudioPlaybackPipelineEventForTest,
   getLiveKitMicPublishOptionsForTest,
   isLiveKitMicAudioActiveForTest,
 } from "../src/mediaSession";
@@ -30,6 +31,29 @@ describe("LiveKit microphone activity detection", () => {
     expect(createLiveKitAudioPlaybackStateForTest(true)).toMatchObject({
       mode: "livekit",
       status: "connected",
+    });
+  });
+
+  test("does not advance playback pipeline on initial LiveKit playback false event", () => {
+    expect(getLiveKitAudioPlaybackPipelineEventForTest(false, false)).toEqual({
+      event: undefined,
+      nextWasPlaying: false,
+    });
+    expect(getLiveKitAudioPlaybackPipelineEventForTest(true, false)).toEqual({
+      event: {
+        detail: "LiveKit Agent 远端音频正在播放。",
+        stage: "playback",
+        status: "active",
+      },
+      nextWasPlaying: true,
+    });
+    expect(getLiveKitAudioPlaybackPipelineEventForTest(false, true)).toEqual({
+      event: {
+        detail: "LiveKit Agent 远端音频播放完成。",
+        stage: "playback",
+        status: "done",
+      },
+      nextWasPlaying: false,
     });
   });
 });
